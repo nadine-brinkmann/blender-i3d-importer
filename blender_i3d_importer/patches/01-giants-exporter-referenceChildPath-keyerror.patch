@@ -1,0 +1,13 @@
+--- i3d_export.py (original, io_export_i3d_10_0_2)
++++ i3d_export.py (patched — referenceChildPath KeyError fix)
+@@ -897,7 +897,9 @@
+             pattern = r'^\d+[>\|]+\d+(\|\d+)*$'  # Ensures first separator is '>' or '|' and the rest are '|'
+             return bool(re.match(pattern, s))
+
+-        refChildPath = data["i3D_referenceChildPath"]
++        # Patch FS25-i3d-Importer: getNodeData() löscht Default-Werte (leerer String "")
++        # vor dem Export → dict-Lookup crasht hier mit KeyError. .get() macht es robust.
++        refChildPath = data.get("i3D_referenceChildPath", "")
+         if refChildPath is not None and len(refChildPath) > 0:
+             if not checkRefChildPathFormat(refChildPath):
+                 raise ValueError('FAILED reference child path of "{}" has wrong format'.format(treeItem._treeID))

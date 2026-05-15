@@ -1,0 +1,13 @@
+--- dcc/dccBlender.py (original, io_export_i3d_10_0_2)
++++ dcc/dccBlender.py (patched — emissiveColor default fix)
+@@ -1702,7 +1702,11 @@
+                 emissiveGreen = surfaceNode.inputs[emissionName].default_value[1]
+                 emissiveBlue = surfaceNode.inputs[emissionName].default_value[2]
+                 emissiveAlpha = surfaceNode.inputs[emissionName].default_value[3]
+-                if not (0, 0, 0, 1) == (emissiveRed,emissiveGreen,emissiveBlue,emissiveAlpha):  #exclude default
++                # Patch FS25-i3d-Importer: Blender-4.x-Default ist (1,1,1,1) mit Strength=0
++                # (kein Licht). Ohne Strength-Check werden alle neuen Materialien fälschlich
++                # als weiß-emittend exportiert.
++                emStrength = surfaceNode.inputs['Emission Strength'].default_value if 'Emission Strength' in surfaceNode.inputs else 0
++                if emStrength > 0 and not (0, 0, 0, 1) == (emissiveRed,emissiveGreen,emissiveBlue,emissiveAlpha):
+                     m_data["emissiveColor"]  = "{:g} {:g} {:g} {:g}".format(emissiveRed,emissiveGreen,emissiveBlue,emissiveAlpha)

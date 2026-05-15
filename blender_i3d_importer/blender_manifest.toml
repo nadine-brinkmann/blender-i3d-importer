@@ -1,0 +1,35 @@
+schema_version = "1.0.0"
+
+id = "blender_i3d_importer"
+version = "0.1.0"
+name = "i3d Importer"
+tagline = "Import Farming Simulator 22 and 25 .i3d files into Blender"
+maintainer = "Nadine Brinkmann <nadinebrinkmann.yt@gmail.com>"
+type = "add-on"
+
+website = "https://github.com/nadine-brinkmann/blender-i3d-importer"
+
+tags = ["Import-Export"]
+
+blender_version_min = "5.1.0"
+
+license = [
+    "SPDX:GPL-3.0-or-later",
+]
+
+copyright = [
+    "2026 Nadine Brinkmann",
+]
+
+# Only Windows because of the bundled native .NET 6 binary (bin/i3dToObjx.exe)
+platforms = ["windows-x64"]
+
+[permissions]
+files = "Read i3d files, textures, and shader XMLs from disk; write temporary OBJx files during import"
+
+[build]
+paths_exclude_pattern = [
+    "__pycache__/",
+    "/.git/",
+    "/*.zip",
+]

@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+
+# Build artifacts (release ZIPs are uploaded to GitHub Releases, not committed)
+*.zip
+
+# Blender backups
+*.blend1
+*.blend2
+*.blend@
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Nextcloud sync files (in case the repo lives inside a Nextcloud folder)
+.~lock.*
+.sync_*.db
+.sync_*.db-shm
+.sync_*.db-wal
