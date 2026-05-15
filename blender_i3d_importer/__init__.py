@@ -427,7 +427,7 @@ def _debug_mode_items(self, context):
     """
     global _DEBUG_MODE_ITEMS_CACHE
     items = [
-        ('NORMAL', "Normal", "Show the normal PBR material"),
+        ('NORMAL', "Default", "Show the standard PBR material (no debug overlay)"),
     ]
     obj = context.active_object if context else None
     if obj is not None and obj.active_material is not None:
@@ -594,7 +594,7 @@ def register():
     bpy.utils.register_class(FS25_PT_debug_view)
     bpy.types.Scene.fs25_debug_mode = EnumProperty(
         name="FS25 Debug Mode",
-        description="Show normal material, a mask, or vertex colors",
+        description="Show the standard material, a mask, or vertex colors",
         items=_debug_mode_items,
         update=_on_debug_mode_change,
     )
