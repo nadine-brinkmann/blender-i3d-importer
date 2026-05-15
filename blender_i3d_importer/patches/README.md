@@ -1,129 +1,152 @@
-# Patches für den Giants i3d Exporter
+# Patches for the Giants i3d Exporter
 
-Diese Patches sind nötig, damit unser **FS25 i3d Importer** Roundtrips über
-den offiziellen Giants i3d Exporter (`io_export_i3d_10_0_2`) korrekt
-durchführen kann. Sie patchen den Giants-Exporter direkt — analog zu unseren
-Patches am `I3DShapesTool-OBJx`-Fork (siehe Phase-A-Notiz im Vault).
+These patches are **optional**. You only need them if you want to re-export
+an imported `.i3d` through the official Giants i3d Exporter
+(`io_export_i3d_10_0_x`) and have the round-trip work cleanly. If you only
+**import** files into Blender (no re-export), skip this entirely.
 
-## Übersicht
+## Overview
 
-| Patch                                                            | Symptom                                                  | Status     |
-| ---------------------------------------------------------------- | -------------------------------------------------------- | ---------- |
-| `01-giants-exporter-referenceChildPath-keyerror.patch`           | `KeyError: 'i3D_referenceChildPath'` beim Export         | erforderlich, wenn die i3d ReferenceNodes enthält |
-| `02-giants-exporter-emissive-color-default.patch`                | `emissiveColor="1 1 1 1"` an jedem Material in der i3d   | empfohlen für alle Workflows |
+| Patch | Symptom | When needed |
+|---|---|---|
+| `01-giants-exporter-referenceChildPath-keyerror.patch` | `KeyError: 'i3D_referenceChildPath'` during re-export | When the i3d contains ReferenceNodes (most vehicles, many buildings) |
+| `02-giants-exporter-emissive-color-default.patch` | Every material gets `emissiveColor="1 1 1 1"` in the re-exported i3d | Recommended for all round-trip workflows |
+
+## Where to find the Giants Exporter
+
+The exporter is installed as a Blender add-on. The folder is named
+`io_export_i3d_10_0_x` (where `x` is the minor version) and located under
+your Blender user-add-on folder:
+
+- **Windows:** `%APPDATA%\Blender Foundation\Blender\<version>\scripts\addons\io_export_i3d_10_0_x\`
+
+Replace `<version>` with your Blender version (e.g. `5.1`).
+
+You can also find the exact path inside Blender:
+`Edit` → `Preferences` → `Add-ons` → search for `i3d` → expand the Giants
+exporter entry → check the **File** path shown there.
 
 ---
 
 ## Patch 01 — `referenceChildPath` KeyError
 
-**Bug-Symptom:** Beim Re-Export einer importierten i3d, die `<ReferenceNode>`-
-Einträge enthält (z.B. `precea4500.i3d` mit Light-Referenzen), bricht der
-Giants-Exporter mit dieser Meldung ab:
+### Symptom
+
+Re-exporting an i3d that contains `<ReferenceNode>` entries (e.g. most FS25
+vehicle files) aborts the Giants exporter with:
 
 ```
-'i3D_referenceChildPath'
+KeyError: 'i3D_referenceChildPath'
 ```
 
-**Ursache** (verifiziert im Giants-Exporter-Source):
+### Cause
 
-1. Beim Sammeln der Node-Daten iteriert der Exporter über alle Custom Properties
-   des Blender-Objects (`dcc/__init__.py`, `getNodeData`, ~Zeile 591).
-2. Properties, deren Wert dem **Default** aus `SETTINGS_ATTRIBUTES` entspricht,
-   werden in `propsToDelete` gesammelt und anschließend **vom Object gelöscht**
-   (Zeilen 598-602).
-3. Für `i3D_referenceChildPath` ist der Default `""`. Unser Importer setzt diese
-   Property auf `""` (weil im Source-XML `referenceChildPath` praktisch nie
-   gesetzt ist). → Property wird gelöscht.
-4. Später in `i3d_export.py` Zeile 900 wird die Property aber per
-   `data["i3D_referenceChildPath"]` ohne `.get()` gelesen → KeyError.
+Inside the exporter (`dcc/__init__.py`, `getNodeData`, around line 591),
+custom properties whose value matches the default from `SETTINGS_ATTRIBUTES`
+are collected and deleted from the object. The default for
+`i3D_referenceChildPath` is `""`. Our importer sets this property to `""`
+(because the source XML almost never sets `referenceChildPath`). Result:
+the property gets deleted, but later (`i3d_export.py` around line 900) it
+is read with a hard `data["i3D_referenceChildPath"]` lookup that throws
+KeyError.
 
-**Fix:** Eine Zeile in `i3d_export.py`:
+### Fix — one-line change
 
-```diff
--        refChildPath = data["i3D_referenceChildPath"]
-+        refChildPath = data.get("i3D_referenceChildPath", "")
+**File:** `io_export_i3d_10_0_x/i3d_export.py`
+
+**Find:**
+```python
+        refChildPath = data["i3D_referenceChildPath"]
 ```
 
-`.get()` mit Default `""` macht es robust. Das nachfolgende `len > 0`-Check
-überspringt die XML-Ausgabe dann ordnungsgemäß.
+**Replace with:**
+```python
+        refChildPath = data.get("i3D_referenceChildPath", "")
+```
+
+`.get()` with a `""` default makes the lookup robust. The existing
+downstream `len > 0` check then skips the XML output properly.
 
 ---
 
----
+## Patch 02 — `emissiveColor` default bug (Blender 4.x+)
 
-## Patch 02 — `emissiveColor` Default-Bug in Blender 4.x
+### Symptom
 
-**Bug-Symptom:** Jedes über den Giants-Exporter exportierte Material in der i3d enthält fälschlich:
+Every material in the re-exported i3d contains:
 
 ```xml
 <Material ... emissiveColor="1 1 1 1">
 ```
 
-Auch bei Materialien, die im Blender überhaupt keine Emission haben.
+Even materials with no Emission set in Blender.
 
-**Ursache** (verifiziert in `dcc/dccBlender.py` ~Z. 1699-1706):
+### Cause
 
-1. In Blender 4.x ist der Default für den Principled-BSDF-Input `Emission Color` `(1, 1, 1, 1)` (weiß), aber `Emission Strength` ist `0.0` — d.h. das Material strahlt kein Licht ab.
-2. Der Exporter prüft jedoch nur `Emission Color != (0, 0, 0, 1)` und ignoriert `Emission Strength`. → Default-Color triggert die Ausgabe von `emissiveColor`.
+In Blender 4.x+ the Principled BSDF input `Emission Color` defaults to
+`(1, 1, 1, 1)` (white) while `Emission Strength` defaults to `0.0` — so
+the material emits no actual light. The Giants exporter
+(`dcc/dccBlender.py` around line 1700) only checks
+`Emission Color != (0, 0, 0, 1)` and ignores `Emission Strength`. The
+default white color falsely triggers the `emissiveColor` output.
 
-**Fix:** `Emission Strength`-Check ergänzen:
+### Fix — check `Emission Strength` too
 
-```diff
--                if not (0, 0, 0, 1) == (emissiveRed,emissiveGreen,emissiveBlue,emissiveAlpha):
-+                emStrength = surfaceNode.inputs['Emission Strength'].default_value if 'Emission Strength' in surfaceNode.inputs else 0
-+                if emStrength > 0 and not (0, 0, 0, 1) == (emissiveRed,emissiveGreen,emissiveBlue,emissiveAlpha):
-                     m_data["emissiveColor"]  = "..."
+**File:** `io_export_i3d_10_0_x/dcc/dccBlender.py`
+
+**Find:**
+```python
+                if not (0, 0, 0, 1) == (emissiveRed, emissiveGreen, emissiveBlue, emissiveAlpha):
+                    m_data["emissiveColor"] = ...
 ```
 
-**Zielpfad:** `C:\Users\nadin\AppData\Roaming\Blender Foundation\Blender\5.1\scripts\addons\io_export_i3d_10_0_2\dcc\dccBlender.py`
-
-**Ergänzender Workaround im FS25-i3d-Importer:** Beim Anlegen von Materialien wird `Emission Color = (0, 0, 0, 1)` explizit gesetzt (siehe `importer.py._build_material`). Damit funktioniert auch ein ungepatchter Exporter für die von uns importierten Materialien. **Aber:** ohne Patch 02 sind selbst erstellte / hand-erstellte Materialien immer noch betroffen.
-
----
-
-## Anwendung
-
-**Zielpfad Patch 01:** `C:\Users\nadin\AppData\Roaming\Blender Foundation\Blender\5.1\scripts\addons\io_export_i3d_10_0_2\i3d_export.py`
-
-**Zielpfad Patch 02:** `C:\Users\nadin\AppData\Roaming\Blender Foundation\Blender\5.1\scripts\addons\io_export_i3d_10_0_2\dcc\dccBlender.py`
-
-### Variante A — Manuell (empfohlen)
-
-1. Datei in einem Editor öffnen.
-2. Nach `data["i3D_referenceChildPath"]` suchen (eine einzelne Trefferstelle,
-   aktuell Zeile 900).
-3. Ersetzen durch `data.get("i3D_referenceChildPath", "")`.
-4. Datei speichern. Blender neu starten oder Addon deaktivieren+aktivieren.
-
-### Variante B — Mit `patch.exe` (z.B. via Git-Bash)
-
-```cmd
-cd "C:\Users\nadin\AppData\Roaming\Blender Foundation\Blender\5.1\scripts\addons\io_export_i3d_10_0_2"
-patch -p0 < "E:\Nextcloud\Blender\add-ons eigen\fs25_i3d_importer\patches\01-giants-exporter-referenceChildPath-keyerror.patch"
+**Replace with:**
+```python
+                emStrength = surfaceNode.inputs['Emission Strength'].default_value if 'Emission Strength' in surfaceNode.inputs else 0
+                if emStrength > 0 and not (0, 0, 0, 1) == (emissiveRed, emissiveGreen, emissiveBlue, emissiveAlpha):
+                    m_data["emissiveColor"] = ...
 ```
 
-Die Patch-Datei nutzt Suchstrings als Anker (kein hartes Zeilennummern-
-Hardcoding), funktioniert also auch, wenn der Giants-Exporter in einer
-zukünftigen Version andere Zeilennummern hat — solange der Code-Schnipsel
-selbst unverändert bleibt.
+> **Note:** Our i3d Importer already sets `Emission Color = (0, 0, 0, 1)`
+> explicitly on every imported material, so even an unpatched exporter
+> handles imported materials correctly. Patch 02 only matters for
+> hand-built or otherwise-sourced materials.
 
 ---
 
-## Bei Giants-Exporter-Updates
+## Applying the patches
 
-Nach jedem Update von `io_export_i3d_*` muss der Patch erneut angewendet
-werden (die Update-Installation überschreibt den Exporter-Source).
+### Variant A — Manual (recommended, no tools needed)
 
-**Prüfung, ob Patch noch nötig ist:** in `i3d_export.py` nach
-`data["i3D_referenceChildPath"]` (ohne `.get()`) suchen. Wenn der String
-gefunden wird → Patch nötig. Wenn nicht → Giants hat den Bug selbst gefixt
-und der Patch kann übersprungen werden.
+1. Open the target file in any text editor.
+2. Search for the "Find" string above.
+3. Replace it with the "Replace with" string.
+4. Save the file.
+5. Restart Blender (or disable + re-enable the Giants exporter add-on).
+
+### Variant B — Using `patch` (Git Bash / Linux / WSL)
+
+If `patch.exe` is available (it ships with Git for Windows):
+
+```bash
+cd "<path-to-Giants-exporter-folder>"
+patch -p0 < "<path-to-this-repo>/blender_i3d_importer/patches/01-giants-exporter-referenceChildPath-keyerror.patch"
+patch -p0 < "<path-to-this-repo>/blender_i3d_importer/patches/02-giants-exporter-emissive-color-default.patch"
+```
+
+The patch files use search-string anchors (no hard-coded line numbers),
+so they keep working even if a future Giants exporter version shifts the
+surrounding code around — as long as the relevant code snippet itself
+stays the same.
 
 ---
 
-## Verwandt
+## After a Giants Exporter update
 
-- Vault-Notiz: `3-BEREICHE/Modding/LS/Blender-Addon i3d-Import Phase C.md`
-  (Stolperstein 10)
-- Analoge Patch-Stelle: `C:\GiantsTools\I3DShapesTool-OBJx-FS25_source\patches\`
-  (Patches am `I3DShapesTool-OBJx`-Fork)
+The exporter installer overwrites its source files, so any patches you
+applied are lost. Re-apply them after each update.
+
+**Quick check whether the patches are still needed:** search inside
+`i3d_export.py` for `data["i3D_referenceChildPath"]` (without `.get()`).
+- Found → patch 01 still needed.
+- Not found → Giants fixed it themselves; you can skip patch 01.

@@ -67,18 +67,23 @@ After import, the **3D viewport sidebar** (press `N`) offers four panels:
 ## Round-trip via the Giants i3d Exporter
 
 The re-export materials are designed to round-trip cleanly through the official
-[Giants i3d Exporter](https://gdn.giants-software.com/downloads.php) for Blender. Two patches
-against the Giants exporter ship in the `patches/` folder, fixing issues with reference nodes
-and emissive defaults. See `patches/README.md` for how to apply them.
+[Giants i3d Exporter](https://gdn.giants-software.com/downloads.php) for Blender. Two
+**optional** patches against the Giants exporter ship in the `patches/` folder, needed
+only if you want to re-export an imported `.i3d`. They fix two issues:
+1. ReferenceNodes cannot be re-exported out of the box. A small fix needs to be done to the Giants i3d Exporter for this to work. 
+2. The Giants i3d Exporter exports all materials with a white emissive map by default although there is none. This is only a wrong default and kann be fixed easily.
+
+See [`patches/README.md`](blender_i3d_importer/patches/README.md)
+for the manual application steps (not difficult, few-line edits in two files, described in detail).
 
 ## Known limitations
 
 - **Reference node recursion** — referenced sub-i3ds are not automatically loaded. They remain
   as empty placeholders with the original `i3D_referenceFilename` custom property, which the
-  Giants exporter writes back correctly on re-export.
+  Giants exporter writes back correctly on re-export after you applied the fix in the patches (see above).
 - **Skin bindings** — meshes bound to multiple transform groups via `skinBindNodeIds` are
   imported as info-only strings; skin animation is lost on re-export. Affects roughly 500
-  base-game vehicle implements.
+  base-game vehicle implements. Not in scope for the current version due to limitations in the Exporter.
 - **Windows only** — the bundled extraction tool is a .NET 6 Windows binary. macOS and Linux
   would require rebuilding the tool natively.
 
