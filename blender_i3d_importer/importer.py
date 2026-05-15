@@ -1011,25 +1011,10 @@ def _build_material(material_id, scene, image_cache, shader_cache, i3d_dir, repo
     if gm_node is not None:
         nt.links.new(gm_node.outputs['Color'], bsdf.inputs['Roughness'])
 
-    # Debug Switch - same group as the PBR debug material gets,
-    # but only baseTexture / normalMap / glossMap are exposed as masks here
-    # since the re-export material doesn't load custom maps. All three use
-    # the default UVMap (uv0) in the re-export material.
-    output_node = nt.nodes.get('Material Output')
-    if output_node is not None:
-        _debug_images = {}
-        if tex_node is not None and tex_node.image is not None:
-            _debug_images['baseTexture'] = tex_node.image
-        if nm_node is not None and nm_node.image is not None:
-            _debug_images['normalMap'] = nm_node.image
-        if gm_node is not None and gm_node.image is not None:
-            _debug_images['glossMap'] = gm_node.image
-        _debug_uv_types = {name: 'uv0' for name in _debug_images}
-        recipe_loader._add_debug_switch(mat, bsdf, output_node,
-                                        debug_images=_debug_images,
-                                        debug_uv_types=_debug_uv_types)
-        # Finalize layout: BSDF + Switch + Output far right, framed.
-        recipe_loader._finalize_layout(mat, bsdf, output_node)
+    # Re-export materials intentionally don't get the fs25_debug:* switch -
+    # the Mix Shader before Material Output would break re-export through
+    # the Giants i3d Exporter. Debug-view lives only on the PBR debug
+    # material (built below if BUILD_PBR_DEBUG_MATERIALS is enabled).
 
     # Re-export relevant material properties
     _apply_material_custom_properties(mat, mat_attrs, scene, report, mat_name)
