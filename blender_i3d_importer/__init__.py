@@ -493,26 +493,12 @@ class FS25_PT_debug_view(bpy.types.Panel):
                     text="Only active material")
 
         # Vertex Color attribute name - searchable dropdown sourced from
-        # the active mesh's color_attributes collection. Auto-defaults to
-        # the first CORNER attribute (the OBJx importer's domain) when the
-        # field is still empty, so users typically don't have to pick
-        # anything manually.
+        # the active mesh's color_attributes collection. 
         vc_attr = mat.node_tree.nodes.get("fs25_debug:vertex_color")
         mesh = obj.data if obj.type == 'MESH' else None
         if vc_attr is not None:
             box = layout.box()
             box.label(text="Vertex Color layer:", icon='COLOR')
-
-            # Auto-default once: pick first CORNER, fall back to first overall.
-            if (not vc_attr.attribute_name
-                    and mesh is not None
-                    and hasattr(mesh, 'color_attributes')
-                    and len(mesh.color_attributes) > 0):
-                chosen = next((ca.name for ca in mesh.color_attributes
-                               if ca.domain == 'CORNER'), None)
-                if chosen is None:
-                    chosen = mesh.color_attributes[0].name
-                vc_attr.attribute_name = chosen
 
             if mesh is not None and hasattr(mesh, 'color_attributes'):
                 box.prop_search(vc_attr, "attribute_name",
