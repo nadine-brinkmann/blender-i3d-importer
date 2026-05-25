@@ -390,6 +390,7 @@ def parse_shape_entity(raw_entity, file_version: int) -> Shape:
     r = _ByteReader(raw_entity.data)
     sh = Shape()
     sh.name, sh.id = _read_part_header(r)
+    sh.file_version = file_version
 
     # ----- ReadContents (I3DShape.cs:84+) -----
     sh.bounding_volume = Vector4.read(r)

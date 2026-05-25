@@ -350,6 +350,10 @@ def import_i3d(i3d_filepath: str, report: Callable = None,
             if top_level:
                 _apply_axis_correction(top_level, _report)
 
+        # FS22 merge-group slots are in root space; remap to bone-local now that
+        # axis correction has finalized world transforms (GitHub #2).
+        _fix_fs22_mergegroup_local_space(import_collection, _report)
+
         # apply hide AFTER axis correction. hide_set matches the H
         # shortcut (view-layer eye). On Giants re-export this leads to
         # visibility="false" in the XML because the exporter reads
@@ -2578,6 +2582,36 @@ def _process_skin_weights(import_collection, shape_map, shape_id_to_obj, report)
 # ---------------------------------------------------------------------------
 
 
+def _fix_fs22_mergegroup_local_space(import_collection, report):
+    """FS22 (shapes v7) merge-group slots store vertices in the merge-group
+    root's space, not in each bound node's local space like FS25 (v10).
+
+    Runs AFTER axis correction, when every object's matrix_world is the correct
+    Z-up world transform (transform_apply has finalized positions; see the
+    bone-translation note in Phase E). For each tagged v7 slot mesh, map verts
+    from root space into the slot's local space via T = M_bone_inv @ M_root, so
+    it renders at the assembled position. mesh.transform also rotates the custom
+    split normals (verified empirically). GitHub #2.
+    """
+    import bpy as _bpy
+    count = 0
+    for obj in list(import_collection.objects):
+        root_name = obj.get('_i3d_fs22_mg_root')
+        if root_name is None:
+            continue
+        try:
+            if obj.type == 'MESH':
+                root_obj = _bpy.data.objects.get(root_name)
+                if root_obj is not None:
+                    T = obj.matrix_world.inverted() @ root_obj.matrix_world
+                    obj.data.transform(T)
+                    count += 1
+        finally:
+            del obj['_i3d_fs22_mg_root']
+    if count:
+        report('INFO', f"FS22 merge-group local-space fix: {count} slot mesh(es)")
+
+
 def _process_merge_groups(import_collection, shape_map, shape_id_to_obj, report):
     """For each MergeGroup-Shape (1 bone-index per vertex):
       - Split the merged geometry per source-TG via blend_indices[i][0]
@@ -2873,6 +2907,10 @@ def _process_merge_groups(import_collection, shape_map, shape_id_to_obj, report)
 
             source_obj['i3D_mergeGroup'] = mg_num
             source_obj['i3D_mergeGroupRoot'] = False
+            # FS22 (v7) verts are in root space; flag for the post-axis-correction
+            # local-space fix (GitHub #2). FS25 (v10) is already bone-local.
+            if (getattr(shape, 'file_version', None) or 99) < 10:
+                source_obj['_i3d_fs22_mg_root'] = root_obj.name
             # Inherit render-relevant properties from root (only if not already
             # set on the member — e.g. _i3d_raw_* and userAttributes survive).
             for _ip_name, _ip_val in inherited.items():
