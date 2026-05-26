@@ -1,0 +1,46 @@
+--- dcc/dccBlender.py (original, io_export_i3d_10_0_2)
++++ dcc/dccBlender.py (patched — mergeGroup noBindPose / member-local verts)
+@@ -408,21 +408,27 @@
+         # Making sure the root is the first entry in the mergeData dict
+         rootIndex = sceneNodeData["mergeGroupMember"].index(rootName)
+         rootMemberId = sceneNodeData['skinBindNodeIds'][rootIndex]
+-        rootMemberResult = getMergeMemberShapeData(rootName, int(rootIndex), rootName, True, True, True)
++        # Patch FS25-i3d-Importer: applyTrans/Rot/Scale=False -> Verts bleiben
++        # member-lokal (FS25-Konvention) statt in Root-Raum gebacken zu werden.
++        rootMemberResult = getMergeMemberShapeData(rootName, int(rootIndex), rootName, False, False, False)
+         mergeData[rootIndex] = rootMemberResult
+         skinBindNodeIds.insert(0, rootMemberId)
+         shapeData = rootMemberResult  # Initialize shapeData with root data
+
+         # Rest of the merge group members
+         for index, memberNameStr in enumerate(sceneNodeData["mergeGroupMember"]):
+             if memberNameStr == rootName:
+                 # Skip the root since it's already handled
+                 continue
+             memberId = sceneNodeData['skinBindNodeIds'][index]
+-            memberResult = getMergeMemberShapeData(memberNameStr, int(index), rootName, True, True, True)
++            memberResult = getMergeMemberShapeData(memberNameStr, int(index), rootName, False, False, False)
+             mergeData[index] = memberResult
+             skinBindNodeIds.append(memberId)
+         overrideBV(shapeNameStr, shapeData, sceneNodeData)
+         shapeData['name'] = f"mergeGroupShape{sceneNodeData['mergeGroupNum']:d}"
+         shapeData['isOptimized'] = "false"
+         shapeData['skinBindNodeIds'] = " ".join(map(str, skinBindNodeIds))
++        # Patch FS25-i3d-Importer: noBindPose='true' signalisiert dem Converter,
++        # dass die Verts in jedem gebundenen Knoten lokal liegen (FS25-Format).
++        # Ohne dieses Flag interpretiert die Engine sie als Root-Raum (FS22-Stil),
++        # was auch GE-Funktionen wie "dissolve merge group" verwirrt.
++        shapeData['noBindPose'] = 'true'
+--- i3d_export.py (original, io_export_i3d_10_0_2)
++++ i3d_export.py (patched — emit noBindPose attribute on IndexedTriangleSet)
+@@ -1255,6 +1255,11 @@
+         if "isOptimized" in data:
+             self._xmlWriteString( xmlCurrent, "isOptimized", data["isOptimized"]  )
++        if "noBindPose" in data:
++            # Patch FS25-i3d-Importer: noBindPose='true' signalisiert FS25-Format
++            # (Verts in jedem gebundenen Knoten lokal). Ohne dieses Attribut auf
++            # dem IndexedTriangleSet wird das Flag vom Converter ignoriert.
++            self._xmlWriteString( xmlCurrent, "noBindPose", data["noBindPose"]  )
+         vertices = data["Vertices"]
+         triangles = data["Triangles"]
+         subsets = data["Subsets"]

@@ -350,9 +350,10 @@ def import_i3d(i3d_filepath: str, report: Callable = None,
             if top_level:
                 _apply_axis_correction(top_level, _report)
 
-        # FS22 merge-group slots are in root space; remap to bone-local now that
-        # axis correction has finalized world transforms (GitHub #2).
-        _fix_fs22_mergegroup_local_space(import_collection, _report)
+        # Root-space merge-group slots (noBindPose flag absent on the shape)
+        # are remapped to bone-local now that axis correction has finalized world
+        # transforms. Covers FS22 v7 AND Giants-Blender-exporter v10 (#2 / #8).
+        _fix_rootspace_mergegroup_local_space(import_collection, _report)
 
         # apply hide AFTER axis correction. hide_set matches the H
         # shortcut (view-layer eye). On Giants re-export this leads to
@@ -2582,21 +2583,24 @@ def _process_skin_weights(import_collection, shape_map, shape_id_to_obj, report)
 # ---------------------------------------------------------------------------
 
 
-def _fix_fs22_mergegroup_local_space(import_collection, report):
-    """FS22 (shapes v7) merge-group slots store vertices in the merge-group
-    root's space, not in each bound node's local space like FS25 (v10).
+def _fix_rootspace_mergegroup_local_space(import_collection, report):
+    """Map root-space merge-group slot vertices into each bound node's local
+    space. Triggered for shapes whose noBindPose flag is absent (Shape options
+    high bit 0x80000000 cleared) -> verts are in the merge-group root's space.
+    Covers FS22 v7 AND files produced by the Giants Blender exporter (which
+    never writes the flag, regardless of file version) -- see GitHub #2 / #8.
 
     Runs AFTER axis correction, when every object's matrix_world is the correct
     Z-up world transform (transform_apply has finalized positions; see the
-    bone-translation note in Phase E). For each tagged v7 slot mesh, map verts
-    from root space into the slot's local space via T = M_bone_inv @ M_root, so
-    it renders at the assembled position. mesh.transform also rotates the custom
-    split normals (verified empirically). GitHub #2.
+    bone-translation note in Phase E). For each tagged slot mesh, map verts from
+    root space into the slot's local space via T = M_bone_inv @ M_root, so it
+    renders at the assembled position. mesh.transform also rotates the custom
+    split normals (verified empirically).
     """
     import bpy as _bpy
     count = 0
     for obj in list(import_collection.objects):
-        root_name = obj.get('_i3d_fs22_mg_root')
+        root_name = obj.get('_i3d_rootspace_mg_root')
         if root_name is None:
             continue
         try:
@@ -2607,9 +2611,9 @@ def _fix_fs22_mergegroup_local_space(import_collection, report):
                     obj.data.transform(T)
                     count += 1
         finally:
-            del obj['_i3d_fs22_mg_root']
+            del obj['_i3d_rootspace_mg_root']
     if count:
-        report('INFO', f"FS22 merge-group local-space fix: {count} slot mesh(es)")
+        report('INFO', f"Root-space merge-group local-space fix: {count} slot mesh(es)")
 
 
 def _process_merge_groups(import_collection, shape_map, shape_id_to_obj, report):
@@ -2907,10 +2911,11 @@ def _process_merge_groups(import_collection, shape_map, shape_id_to_obj, report)
 
             source_obj['i3D_mergeGroup'] = mg_num
             source_obj['i3D_mergeGroupRoot'] = False
-            # FS22 (v7) verts are in root space; flag for the post-axis-correction
-            # local-space fix (GitHub #2). FS25 (v10) is already bone-local.
-            if (getattr(shape, 'file_version', None) or 99) < 10:
-                source_obj['_i3d_fs22_mg_root'] = root_obj.name
+            # Root-space merge groups (noBindPose flag absent on the shape) need
+            # the post-axis local-space fix. Bone-local shapes (FS25-Giants) skip.
+            # Covers FS22 v7 AND Giants-Blender-exporter v10 outputs (#2 / #8).
+            if not getattr(shape, 'no_bind_pose', False):
+                source_obj['_i3d_rootspace_mg_root'] = root_obj.name
             # Inherit render-relevant properties from root (only if not already
             # set on the member — e.g. _i3d_raw_* and userAttributes survive).
             for _ip_name, _ip_val in inherited.items():

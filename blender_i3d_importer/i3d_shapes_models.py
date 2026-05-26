@@ -402,6 +402,15 @@ def parse_shape_entity(raw_entity, file_version: int) -> Shape:
     # Only keep the known low bits in our enum; preserve high bits separately.
     sh.options = ShapeOptions(options_raw & int(ShapeOptions.ALL))
     sh.options_high_bits = options_raw & ~int(ShapeOptions.ALL)
+    # noBindPose flag (high bit 0x80000000): when set, merge-group vertices
+    # are stored in each bound node's local space (FS25-Giants convention).
+    # When cleared / missing, the vertices are in the merge-group root's
+    # space (FS22 v7 AND files produced by the Giants Blender exporter, which
+    # never writes this flag). Authoritative discriminator for the root-space
+    # -> bone-local correction (GitHub #2/#8); verified empirically against
+    # four sample files (Giants FS25, FS22 v7, Blender-export v10, Blender
+    # re-export v10).
+    sh.no_bind_pose = bool(sh.options_high_bits & 0x80000000)
 
     # 4-byte slot before the Subsets list. The C# reference (I3DShape.cs:97)
     # only reads this for file_version >= 10 and names it 'vtxCompression'.

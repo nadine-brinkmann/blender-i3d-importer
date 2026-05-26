@@ -11,6 +11,7 @@ an imported `.i3d` through the official Giants i3d Exporter
 |---|---|---|
 | `01-giants-exporter-referenceChildPath-keyerror.patch` | `KeyError: 'i3D_referenceChildPath'` during re-export | When the i3d contains ReferenceNodes (most vehicles, many buildings) |
 | `02-giants-exporter-emissive-color-default.patch` | Every material gets `emissiveColor="1 1 1 1"` in the re-exported i3d | Recommended for all round-trip workflows |
+| `03-giants-exporter-mergegroup-nobindpose.patch` | Re-exported MergeGroups end up in root space (FS22-style) → child positions shift on re-import, GE's *dissolve merge group* corrupts mesh/normals/UVs | Recommended for all round-trip workflows that touch MergeGroups |
 
 ## Where to find the Giants Exporter
 
@@ -114,6 +115,127 @@ default white color falsely triggers the `emissiveColor` output.
 
 ---
 
+## Patch 03 — `mergeGroup` written in root space without `noBindPose`
+
+### Symptom
+
+After re-exporting a scene that contains MergeGroups, two things go wrong:
+
+1. Re-importing the exported `.i3d` shows the merge-group children **shifted
+   by the origin-to-root vector** (rotations even doubled). Round-tripping
+   the same file repeatedly stacks the offset cumulatively.
+2. In the Giants Editor, the *dissolve merge group* function corrupts the
+   mesh, normals **and** UVs of the dissolved members.
+
+### Cause
+
+The Giants exporter's `getMergeGroupShapeData` in `dcc/dccBlender.py` calls
+`getMergeMemberShapeData(..., True, True, True)` for every member —
+`applyTrans/Rot/Scale=True`. The helper's own docstring states
+*"vertices are transformed to root space"*. So each member's world transform
+gets baked into its vertex positions, and the resulting MergeGroup is in
+root space (the FS22 convention).
+
+The FS25 convention expects vertices in each bound node's local space, with
+the shape carrying a `noBindPose="true"` flag in its `IndexedTriangleSet`.
+The Giants Blender exporter never sets this flag and never produces local
+verts, so every Blender-exported MergeGroup ends up FS22-style — even in a
+v10 file. The engine and GE then mis-interpret the data on certain code
+paths.
+
+### Fix — four small changes across two files
+
+**File 1:** `io_export_i3d_10_0_x/dcc/dccBlender.py`
+
+**Change 1 (around the root-member call, ~line 412):**
+
+Find:
+```python
+        rootMemberResult = getMergeMemberShapeData(rootName, int(rootIndex), rootName, True, True, True)
+```
+
+Replace with:
+```python
+        # Patch FS25-i3d-Importer: applyTrans/Rot/Scale=False -> Verts bleiben
+        # member-lokal (FS25-Konvention) statt in Root-Raum gebacken zu werden.
+        rootMemberResult = getMergeMemberShapeData(rootName, int(rootIndex), rootName, False, False, False)
+```
+
+**Change 2 (around the children-member call, ~line 423):**
+
+Find:
+```python
+            memberResult = getMergeMemberShapeData(memberNameStr, int(index), rootName, True, True, True)
+```
+
+Replace with:
+```python
+            memberResult = getMergeMemberShapeData(memberNameStr, int(index), rootName, False, False, False)
+```
+
+**Change 3 (right after the `skinBindNodeIds` line, ~line 429):**
+
+Find:
+```python
+        shapeData['skinBindNodeIds'] = " ".join(map(str, skinBindNodeIds))
+```
+
+Replace with:
+```python
+        shapeData['skinBindNodeIds'] = " ".join(map(str, skinBindNodeIds))
+        # Patch FS25-i3d-Importer: noBindPose='true' signalisiert dem Converter,
+        # dass die Verts in jedem gebundenen Knoten lokal liegen (FS25-Format).
+        # Ohne dieses Flag interpretiert die Engine sie als Root-Raum (FS22-Stil),
+        # was auch GE-Funktionen wie "dissolve merge group" verwirrt.
+        shapeData['noBindPose'] = 'true'
+```
+
+**File 2:** `io_export_i3d_10_0_x/i3d_export.py`
+
+**Change 4 (in `_xmlWriteShape_Mesh`, right after the `isOptimized` write, ~line 1257):**
+
+`shapeData['noBindPose']` from Change 3 only takes effect if the XML writer
+actually emits it on the `IndexedTriangleSet` element — empirically verified.
+
+Find:
+```python
+        if "isOptimized" in data:
+            self._xmlWriteString( xmlCurrent, "isOptimized", data["isOptimized"]  )
+        vertices = data["Vertices"]
+```
+
+Replace with:
+```python
+        if "isOptimized" in data:
+            self._xmlWriteString( xmlCurrent, "isOptimized", data["isOptimized"]  )
+        if "noBindPose" in data:
+            # Patch FS25-i3d-Importer: noBindPose='true' signalisiert FS25-Format
+            # (Verts in jedem gebundenen Knoten lokal). Ohne dieses Attribut auf
+            # dem IndexedTriangleSet wird das Flag vom Converter ignoriert.
+            self._xmlWriteString( xmlCurrent, "noBindPose", data["noBindPose"]  )
+        vertices = data["Vertices"]
+```
+
+### Verification after applying
+
+1. Re-export a small MergeGroup test setup (e.g. a parent with two child cubes
+   at offsets, with the exporter Attributes set so the children are MergeGroup
+   members of the parent).
+2. Decode the resulting `.i3d.shapes` and check the MergeGroup shape:
+   - Shape options high bit `0x80000000` is **set** (this is the `noBindPose`
+     bit).
+   - Per-slot vertex centroids cluster near each member's own origin
+     (member-local), **not** at the bound node's world position (root-space).
+3. Re-importing the exported file with this add-on should now place the
+   children at the correct world positions on first re-import.
+
+### Hat-tip
+
+modelleicher in [#8](https://github.com/nadine-brinkmann/blender-i3d-importer/issues/8)
+for pointing out the `noBindPose` flag and the GE *dissolve* symptom.
+
+---
+
 ## Applying the patches
 
 ### Variant A — Manual (recommended, no tools needed)
@@ -132,6 +254,7 @@ If `patch.exe` is available (it ships with Git for Windows):
 cd "<path-to-Giants-exporter-folder>"
 patch -p0 < "<path-to-this-repo>/blender_i3d_importer/patches/01-giants-exporter-referenceChildPath-keyerror.patch"
 patch -p0 < "<path-to-this-repo>/blender_i3d_importer/patches/02-giants-exporter-emissive-color-default.patch"
+patch -p0 < "<path-to-this-repo>/blender_i3d_importer/patches/03-giants-exporter-mergegroup-nobindpose.patch"
 ```
 
 The patch files use search-string anchors (no hard-coded line numbers),
