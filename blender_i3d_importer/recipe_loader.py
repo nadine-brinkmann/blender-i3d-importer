@@ -940,8 +940,9 @@ def build_pbr_debug_material(
         mat['_i3d_import_uuid'] = _imp._CURRENT_IMPORT_UUID
 
     nt = mat.node_tree
-    bsdf = nt.nodes.get('Principled BSDF')
-    output_node = nt.nodes.get('Material Output')
+    # Use node type (locale-independent) instead of name (translated in non-English Blender).
+    bsdf = next((n for n in nt.nodes if n.type == 'BSDF_PRINCIPLED'), None)
+    output_node = next((n for n in nt.nodes if n.type == 'OUTPUT_MATERIAL'), None)
     if bsdf is None or output_node is None:
         report('WARNING',
                f"PBR debug '{mat_name}': BSDF or Material Output missing "

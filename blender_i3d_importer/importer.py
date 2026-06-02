@@ -1784,7 +1784,8 @@ def _build_material(material_id, scene, image_cache, shader_cache, i3d_dir, repo
         mat['_i3d_import_uuid'] = _CURRENT_IMPORT_UUID
 
     nt = mat.node_tree
-    bsdf = nt.nodes.get('Principled BSDF')
+    # Use node type (locale-independent) instead of name (translated in non-English Blender).
+    bsdf = next((n for n in nt.nodes if n.type == 'BSDF_PRINCIPLED'), None)
     if bsdf is None:
         # Very unusual, but fallback: empty material
         return mat
