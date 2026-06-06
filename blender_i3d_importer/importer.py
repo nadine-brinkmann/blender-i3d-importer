@@ -18,6 +18,7 @@ Workflow:
 """
 
 import math
+import json
 import re
 import time
 import uuid
@@ -27,6 +28,7 @@ from typing import Callable, Dict, Optional, Tuple
 import bpy
 
 from . import i3d_attr_mapping
+from . import i3d_anim_reader
 from . import i3d_shader_parser
 from . import i3d_xml_parser
 from . import i3d_shapes_reader
@@ -52,6 +54,10 @@ ATTACH_DEBUG_MATERIALS_TO_MESH = False
 # Snippet cache: cleared per import (in import_i3d). Module variable instead
 # of function parameter to avoid massive plumbing through 5 functions.
 _snippet_cache: Dict[str, Optional["bpy.types.NodeTree"]] = {}
+
+# Animation round-trip cache: flushed into Action custom properties once per
+# action, avoiding huge JSON rewrites while importing many keyframes.
+_I3D_KEY_ROTATION_CACHE = {}
 
 # Per-import UUID. Set at the start of every import_i3d() call. Both the
 # re-export material in _build_material() and the debug material in
@@ -100,6 +106,7 @@ def import_i3d(i3d_filepath: str, report: Callable = None,
                terrain_lod: str = 'OFF',
                terrain_base_color=(0.03434, 0.042311, 0.012286, 1.0),
                terrain_poc_layer_names: str = "ASPHALT,GRASS,MUD,FOREST_LEAVES,FOREST_GRASS",
+               import_animations: bool = False,
                fs25_data_base: Optional[str] = None,
                export_dir: Optional[str] = None,
                snippets_blend_path: Optional[str] = None) -> Tuple[int, int]:
@@ -132,8 +139,9 @@ def import_i3d(i3d_filepath: str, report: Callable = None,
     BUILD_PBR_DEBUG_MATERIALS = build_pbr_debug_materials
     ATTACH_DEBUG_MATERIALS_TO_MESH = attach_debug_materials_to_mesh
 
-    # Reset snippet cache per import
+    # Reset per-import caches.
     _snippet_cache.clear()
+    _I3D_KEY_ROTATION_CACHE.clear()
 
     # New UUID per import - stamped on every material pair (export + debug)
     # so the N-Panel "Switch i3d Materials" operator can disambiguate pairs
@@ -346,8 +354,20 @@ def import_i3d(i3d_filepath: str, report: Callable = None,
         # i3D_mergeGroup/i3D_mergeGroupRoot properties on the objects.
         _process_merge_groups(import_collection, shape_map, shape_id_to_obj, _report)
         _process_merge_children(import_collection, shape_map, shape_id_to_obj, _report)
-        _process_skin_weights(import_collection, shape_map, shape_id_to_obj, _report)
+        _process_skin_weights(import_collection, shape_map, shape_id_to_obj,
+                              _report,
+                              use_shared_armatures=import_animations)
         _process_skin_bindings(import_collection, _report)
+
+        animation_count = 0
+        if import_animations:
+            animation_count = _import_animations(scene, import_collection, i3d_dir, _report)
+            if animation_count:
+                _report('INFO', f"Imported {animation_count} animation action(s)")
+        elif scene.external_anim_file or scene.animation_sets:
+            _report('INFO',
+                    "Animation import skipped by user option; skin/armature "
+                    "import stays in the standard mode.")
 
         # axis correction Y-up -> Z-up after the complete hierarchy is
         # built (so all top-level objects exist and the wrapper-empty trick works).
@@ -431,6 +451,11 @@ def import_i3d(i3d_filepath: str, report: Callable = None,
             settings = bpy.context.scene.I3D_UIexportSettings
             settings.i3D_gameLocationDisplay = FS25_DATA_BASE.rstrip("\\/") + "\\"
             settings.i3D_exportUseSoftwareFileName = False
+            if animation_count and hasattr(settings, "i3D_exportAnimation"):
+                settings.i3D_exportAnimation = True
+                _report('INFO',
+                        "Giants exporter Animation enabled; imported actions "
+                        "were marked with i3d_export_owner for exporter lookup")
             if EXPORT_DIR:
                 settings.i3D_exportFileLocation = str(Path(EXPORT_DIR) / i3d.name)
                 _report('INFO',
@@ -1652,6 +1677,9 @@ def _apply_transform(obj, node, parent=None):
     lights). Translation stays raw (already correct) for the same reason.
     """
     import mathutils
+    obj['_i3d_xml_translation'] = "%g %g %g" % tuple(node.translation)
+    obj['_i3d_xml_rotation'] = "%g %g %g" % tuple(node.rotation)
+    obj['_i3d_xml_scale'] = "%g %g %g" % tuple(node.scale)
     obj.location = node.translation
     obj.rotation_mode = 'XYZ'
     xml_euler = mathutils.Euler((
@@ -2081,8 +2109,784 @@ def _apply_material_custom_properties(mat, mat_attrs, scene, report, mat_name):
 
 
 # ---------------------------------------------------------------------------
+# Animation import
+# ---------------------------------------------------------------------------
+
+def _import_animations(scene, import_collection, i3d_dir: Path, report) -> int:
+    """Import inline XML animation sets into Blender actions.
+
+    GIANTS can also store animations in external binary .i3d.anim files. Those
+    are detected here, but decoded by a future binary reader; inline XML data is
+    already enough for files saved before i3dConverter packs the animation.
+    """
+    animation_sets = list(scene.animation_sets)
+    if scene.external_anim_file:
+        _probe_external_anim_file(scene.external_anim_file, i3d_dir, report)
+        try:
+            external_sets = _read_external_anim_sets(
+                scene.external_anim_file, i3d_dir)
+            animation_sets.extend(external_sets)
+            clip_count = sum(len(s.clips) for s in external_sets)
+            report('INFO',
+                   f"Decoded animation file '{scene.external_anim_file}': "
+                   f"{len(external_sets)} set(s), {clip_count} clip(s)")
+        except Exception as e:
+            report('WARNING',
+                   f"Animation file '{scene.external_anim_file}' could not be "
+                   f"decoded: {type(e).__name__}: {e}")
+
+    if not animation_sets:
+        return 0
+
+    _prepare_armatures_for_animation(
+        scene, import_collection, animation_sets, report)
+
+    node_targets = _animation_node_targets(import_collection)
+    rest_matrices = _animation_rest_matrices(scene)
+    rest_transforms = _animation_rest_transforms(scene)
+    has_bone_targets = any(
+        kind == 'BONE'
+        for targets in node_targets.values()
+        for kind, _owner, _bone_name in targets
+    )
+    created_actions = 0
+    preview_actions = {}
+
+    for anim_set in animation_sets:
+        set_name = anim_set.name or "AnimationSet"
+        clip_start_frame = 1.0
+        for clip in anim_set.clips:
+            clip_name = clip.name or "Clip"
+            clip_action = None
+            clip_owners = set()
+
+            for keyframes in clip.keyframes:
+                targets = node_targets.get(keyframes.node_id)
+                if not targets:
+                    report('WARNING',
+                           f"Animation '{set_name}/{clip_name}': "
+                           f"nodeId {keyframes.node_id} not found")
+                    continue
+                if any(kind == 'BONE' for kind, _owner, _bone_name in targets):
+                    targets = [
+                        target for target in targets if target[0] == 'BONE'
+                    ]
+                elif any(kind == 'ARMATURE_ROOT'
+                         for kind, _owner, _bone_name in targets):
+                    targets = [
+                        target for target in targets
+                        if target[0] == 'ARMATURE_ROOT'
+                    ]
+                elif has_bone_targets:
+                    # For skinned assets the original skeleton TransformGroups
+                    # are only import/reference helpers. The visible mesh is
+                    # deformed by wrapper armatures, so object actions on those
+                    # empties look like "one empty animation" and do not move
+                    # the animal.
+                    continue
+
+                for kind, owner, bone_name in targets:
+                    if clip_action is None:
+                        clip_action = bpy.data.actions.new(
+                            name=f"{set_name}_{clip_name}")
+                        clip_action.use_fake_user = True
+                        clip_action["i3d_animation_set"] = set_name
+                        clip_action["i3d_animation_clip"] = clip_name
+                        created_actions += 1
+                    owner.animation_data_create()
+                    owner.animation_data.action = clip_action
+                    clip_owners.add(owner.name)
+
+                    if kind == 'BONE':
+                        rest_matrix = rest_matrices.get(keyframes.node_id)
+                        rest_transform = rest_transforms.get(keyframes.node_id)
+                        _apply_bone_keyframes(
+                            owner, bone_name, keyframes.keys, rest_matrix,
+                            rest_transform=rest_transform,
+                            node_id=keyframes.node_id)
+                        preview_actions.setdefault(owner.name, clip_action)
+                    elif kind == 'ARMATURE_ROOT':
+                        _apply_object_keyframes(
+                            owner, keyframes.keys, node_id=keyframes.node_id,
+                            transform_kind='ARMATURE_ROOT')
+                        preview_actions.setdefault(owner.name, clip_action)
+                    else:
+                        _apply_object_keyframes(
+                            owner, keyframes.keys, node_id=keyframes.node_id)
+                        preview_actions.setdefault(owner.name, clip_action)
+
+            if clip_action is not None:
+                clip_action["i3d_export_owner"] = ";".join(sorted(clip_owners))
+                clip_action["i3d_export_owners"] = ";".join(sorted(clip_owners))
+                _flush_i3d_key_rotations(clip_action)
+                _set_action_interpolation(clip_action, 'LINEAR')
+
+    for owner_name, action in preview_actions.items():
+        owner = bpy.data.objects.get(owner_name)
+        if owner is not None:
+            owner.animation_data_create()
+            owner.animation_data.action = action
+            owner['userAttribute_string_i3dPreviewAction'] = action.name
+
+    _reset_imported_animation_pose(import_collection)
+    _fit_scene_frame_range(animation_sets)
+    return created_actions
+
+
+def _read_external_anim_sets(filename: str, i3d_dir: Path):
+    path = Path(filename)
+    if not path.is_absolute():
+        path = i3d_dir / filename
+    if not path.exists():
+        raise FileNotFoundError(path)
+    return i3d_anim_reader.read_anim_file(path)
+
+
+def _probe_external_anim_file(filename: str, i3d_dir: Path, report):
+    path = Path(filename)
+    if not path.is_absolute():
+        path = i3d_dir / filename
+    if not path.exists():
+        report('WARNING', f"Animation file not found: {path}")
+        return
+
+    try:
+        data = path.read_bytes()[:512]
+        offset = 0
+
+        def read_u32():
+            nonlocal offset
+            if offset + 4 > len(data):
+                raise ValueError("unexpected EOF")
+            value = int.from_bytes(data[offset:offset + 4], 'little')
+            offset += 4
+            return value
+
+        def read_string():
+            nonlocal offset
+            size = read_u32()
+            if size < 0 or offset + size > len(data):
+                raise ValueError("invalid string length")
+            value = data[offset:offset + size].decode('latin1', errors='replace')
+            offset += size
+            while offset % 4:
+                offset += 1
+            return value
+
+        version = read_u32()
+        set_count = read_u32()
+        set_name = read_string() if set_count else ""
+        clip_count = read_u32() if set_count else 0
+        first_clip = read_string() if clip_count else ""
+        report('INFO',
+               f"Animation binary probe: {path.name}, version={version}, "
+               f"sets={set_count}, firstSet='{set_name}', "
+               f"clipsInFirstSet={clip_count}, firstClip='{first_clip}'")
+    except Exception as e:
+        report('INFO', f"Animation binary probe skipped for {path.name}: {e}")
+
+
+def _prepare_armatures_for_animation(scene, import_collection, animation_sets, report):
+    """Add missing animation bones to standard skin armatures.
+
+    The normal importer creates one armature per skinned mesh from that mesh's
+    skinBindNodeIds. External .i3d.anim clips can contain tracks for sibling or
+    parent skeleton nodes that are not weighted by a given mesh, so the action
+    import would otherwise silently skip those tracks. This runs only when the
+    user explicitly enabled animation import; the standard no-animation import
+    path stays byte-for-byte in the old skin setup.
+    """
+
+    animated_ids = {
+        int(keyframes.node_id)
+        for anim_set in animation_sets
+        for clip in anim_set.clips
+        for keyframes in clip.keyframes
+    }
+    if not animated_ids:
+        return
+
+    id_to_node = {}
+    parent_by_id = {}
+
+    def visit(node, parent=None):
+        id_to_node[int(node.nodeId)] = node
+        if parent is not None:
+            parent_by_id[int(node.nodeId)] = int(parent.nodeId)
+        for child in node.children:
+            visit(child, node)
+
+    for root in scene.roots:
+        visit(root)
+
+    node_id_to_obj = {}
+    for obj in import_collection.objects:
+        nid = obj.get('_i3d_nodeId')
+        if nid is None:
+            continue
+        try:
+            node_id_to_obj[int(nid)] = obj
+        except (TypeError, ValueError):
+            pass
+
+    def parse_bone_map(arm_obj):
+        result = {}
+        raw = arm_obj.get('userAttribute_string_skinBoneMap', '')
+        for item in str(raw).split(';'):
+            if not item or ':' not in item:
+                continue
+            bone_name, nid_str = item.rsplit(':', 1)
+            try:
+                result[int(nid_str)] = bone_name
+            except ValueError:
+                continue
+        return result
+
+    def chain_to_root(nid):
+        chain = []
+        while nid is not None and nid in id_to_node:
+            chain.append(nid)
+            nid = parent_by_id.get(nid)
+        chain.reverse()
+        return chain
+
+    def lowest_common_ancestor(node_ids):
+        chains = [chain_to_root(nid) for nid in node_ids if nid in id_to_node]
+        chains = [c for c in chains if c]
+        if not chains:
+            return None
+        common = None
+        for items in zip(*chains):
+            first = items[0]
+            if all(item == first for item in items):
+                common = first
+            else:
+                break
+        return common
+
+    def skeleton_root_for(bound_ids):
+        root_id = lowest_common_ancestor(bound_ids)
+        while root_id is not None:
+            parent_id = parent_by_id.get(root_id)
+            parent_node = id_to_node.get(parent_id)
+            if parent_node is None or not parent_node.name.endswith('_skin_jnt'):
+                break
+            root_id = parent_id
+        return root_id
+
+    def is_descendant_or_self(nid, root_id):
+        if root_id is None:
+            return False
+        while nid is not None:
+            if nid == root_id:
+                return True
+            nid = parent_by_id.get(nid)
+        return False
+
+    def preorder_required(root_id, required_ids):
+        ordered = []
+
+        def walk(node):
+            nid = int(node.nodeId)
+            if nid in required_ids:
+                ordered.append(nid)
+            for child in node.children:
+                walk(child)
+
+        root_node = id_to_node.get(root_id)
+        if root_node is not None:
+            walk(root_node)
+        for nid in sorted(required_ids):
+            if nid not in ordered:
+                ordered.append(nid)
+        return ordered
+
+    import bpy as _bpy
+    from mathutils import Vector as _Vec, Matrix as _Mat
+
+    _bpy.context.view_layer.update()
+    orig_active = _bpy.context.view_layer.objects.active
+
+    for arm_obj in [o for o in import_collection.objects if o.type == 'ARMATURE']:
+        node_to_bone = parse_bone_map(arm_obj)
+        if not node_to_bone:
+            continue
+
+        root_id = skeleton_root_for(node_to_bone.keys())
+        if root_id is None:
+            continue
+
+        required_ids = set(node_to_bone.keys())
+        for nid in animated_ids:
+            if not is_descendant_or_self(nid, root_id):
+                continue
+            current = nid
+            while current is not None:
+                required_ids.add(current)
+                if current == root_id:
+                    break
+                current = parent_by_id.get(current)
+
+        ordered_ids = preorder_required(root_id, required_ids)
+        missing_ids = [
+            nid for nid in ordered_ids
+            if nid not in node_to_bone and nid in id_to_node
+        ]
+        if not missing_ids:
+            continue
+
+        used_names = {bone.name for bone in arm_obj.data.bones}
+        for nid, bone_name in node_to_bone.items():
+            used_names.add(bone_name)
+
+        def unique_bone_name(base_name):
+            name = base_name
+            suffix = 1
+            while name in used_names:
+                name = f"{base_name}.{suffix:03d}"
+                suffix += 1
+            used_names.add(name)
+            return name
+
+        _bpy.context.view_layer.objects.active = arm_obj
+        _bpy.ops.object.mode_set(mode='EDIT')
+        try:
+            for nid in missing_ids:
+                node = id_to_node[nid]
+                bone_name = unique_bone_name(node.name)
+                node_to_bone[nid] = bone_name
+
+                bone = arm_obj.data.edit_bones.new(bone_name)
+                src = node_id_to_obj.get(nid)
+                if src is not None:
+                    inv_arm = arm_obj.matrix_world.inverted()
+                    head_local = (_compute_xml_world_translation(src)
+                                  - _compute_xml_world_translation(arm_obj))
+                    R_xm90 = _Mat.Rotation(math.radians(-90), 3, 'X')
+                    R_xp90 = _Mat.Rotation(math.radians(90), 3, 'X')
+                    src_rot = (inv_arm @ src.matrix_world).to_3x3()
+                    R_target = R_xm90 @ src_rot @ R_xp90
+                    y_axis = R_target.col[1]
+                    z_axis = R_target.col[2]
+                    if y_axis.length > 1e-6:
+                        y_axis.normalize()
+                    else:
+                        y_axis = _Vec((0.0, 1.0, 0.0))
+                    if z_axis.length > 1e-6:
+                        z_axis.normalize()
+                    else:
+                        z_axis = _Vec((0.0, 0.0, 1.0))
+                    bone.head = head_local
+                    bone.tail = bone.head + y_axis * 0.1
+                    bone.align_roll(z_axis)
+
+            for nid in ordered_ids:
+                bone_name = node_to_bone.get(nid)
+                parent_name = node_to_bone.get(parent_by_id.get(nid))
+                if not bone_name or not parent_name:
+                    continue
+                bone = arm_obj.data.edit_bones.get(bone_name)
+                parent = arm_obj.data.edit_bones.get(parent_name)
+                if bone is not None and parent is not None:
+                    bone.parent = parent
+                    bone.use_connect = False
+        finally:
+            _bpy.ops.object.mode_set(mode='OBJECT')
+
+        arm_obj['userAttribute_string_skinBoneMap'] = ';'.join(
+            f"{node_to_bone[nid]}:{int(nid)}"
+            for nid in ordered_ids
+            if nid in node_to_bone
+        )
+        arm_obj['userAttribute_string_skinBoneOriginalNames'] = ','.join(
+            id_to_node[nid].name
+            for nid in ordered_ids
+            if nid in node_to_bone and nid in id_to_node
+        )
+        report('INFO',
+               f"{arm_obj.name}: animation skeleton expanded with "
+               f"{len(missing_ids)} bone(s)")
+
+    if orig_active is not None:
+        try:
+            _bpy.context.view_layer.objects.active = orig_active
+        except Exception:
+            pass
+
+
+def _animation_node_targets(import_collection):
+    """Map i3d nodeId to either an object or a wrapper-armature bone."""
+    targets = {}
+    node_id_to_obj = {}
+    for obj in import_collection.objects:
+        nid = obj.get('_i3d_nodeId')
+        if nid is not None:
+            try:
+                nid_int = int(nid)
+                node_id_to_obj[nid_int] = obj
+                targets.setdefault(nid_int, []).append(('OBJECT', obj, None))
+            except (TypeError, ValueError):
+                pass
+
+    def _root_skin_node_id(mapped_ids):
+        for mapped_id in mapped_ids:
+            source = node_id_to_obj.get(mapped_id)
+            if source is None:
+                continue
+            root = source
+            while (root.parent is not None
+                   and root.parent.name.endswith('_skin_jnt')):
+                root = root.parent
+            try:
+                return int(root.get('_i3d_nodeId'))
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    for obj in import_collection.objects:
+        bone_map = obj.get('userAttribute_string_skinBoneMap')
+        if obj.type == 'ARMATURE' and bone_map:
+            mapped_ids = []
+            for item in str(bone_map).split(';'):
+                if not item or ':' not in item:
+                    continue
+                bone_name, nid_str = item.rsplit(':', 1)
+                try:
+                    nid_int = int(nid_str)
+                    mapped_ids.append(nid_int)
+                    targets.setdefault(nid_int, []).append(
+                        ('BONE', obj, bone_name))
+                except ValueError:
+                    continue
+            root_nid = _root_skin_node_id(mapped_ids)
+            if root_nid is not None and root_nid not in mapped_ids:
+                targets.setdefault(root_nid, []).append(
+                    ('ARMATURE_ROOT', obj, None))
+    return targets
+
+
+def _animation_rest_matrices(scene):
+    matrices = {}
+
+    def visit(node):
+        matrices[node.nodeId] = _i3d_local_matrix(
+            node.translation, node.rotation, node.scale)
+        for child in node.children:
+            visit(child)
+
+    for root in scene.roots:
+        visit(root)
+    return matrices
+
+
+def _animation_rest_transforms(scene):
+    transforms = {}
+
+    def visit(node):
+        transforms[node.nodeId] = (node.translation, node.rotation, node.scale)
+        for child in node.children:
+            visit(child)
+
+    for root in scene.roots:
+        visit(root)
+    return transforms
+
+
+def _clear_armature_bone_selection(arm_obj):
+    """Leave imported armatures editable: no pre-selected bone chains."""
+
+    if arm_obj is None or arm_obj.type != 'ARMATURE':
+        return
+
+    prev_active = bpy.context.view_layer.objects.active
+    prev_selected = list(bpy.context.selected_objects)
+    try:
+        prev_mode = bpy.context.mode
+    except Exception:
+        prev_mode = 'OBJECT'
+
+    try:
+        if prev_mode != 'OBJECT':
+            try:
+                bpy.ops.object.mode_set(mode='OBJECT')
+            except Exception:
+                pass
+        for obj in bpy.context.selected_objects:
+            obj.select_set(False)
+        arm_obj.select_set(True)
+        bpy.context.view_layer.objects.active = arm_obj
+        bpy.ops.object.mode_set(mode='POSE')
+        for pose_bone in arm_obj.pose.bones:
+            pose_bone.select = False
+        try:
+            arm_obj.data.bones.active = None
+        except Exception:
+            pass
+        bpy.ops.object.mode_set(mode='OBJECT')
+    except Exception:
+        pass
+    finally:
+        try:
+            for obj in bpy.context.selected_objects:
+                obj.select_set(False)
+            for obj in prev_selected:
+                if obj.name in bpy.data.objects:
+                    obj.select_set(True)
+            if prev_active is not None and prev_active.name in bpy.data.objects:
+                bpy.context.view_layer.objects.active = prev_active
+            if prev_mode == 'POSE' and prev_active is arm_obj:
+                bpy.ops.object.mode_set(mode='POSE')
+        except Exception:
+            pass
+
+
+def _reset_imported_animation_pose(import_collection):
+    for obj in import_collection.objects:
+        if obj.type != 'ARMATURE':
+            continue
+        preview_action_name = obj.get('userAttribute_string_i3dPreviewAction')
+        if obj.animation_data is not None and not preview_action_name:
+            obj.animation_data.action = None
+        elif obj.animation_data is not None and preview_action_name:
+            preview_action = bpy.data.actions.get(str(preview_action_name))
+            if preview_action is not None:
+                obj.animation_data.action = preview_action
+        for pose_bone in obj.pose.bones:
+            pose_bone.location = (0.0, 0.0, 0.0)
+            pose_bone.rotation_mode = 'XYZ'
+            pose_bone.rotation_euler = (0.0, 0.0, 0.0)
+            pose_bone.scale = (1.0, 1.0, 1.0)
+        _clear_armature_bone_selection(obj)
+    try:
+        bpy.context.scene.frame_set(1)
+    except Exception:
+        pass
+
+
+def _set_action_interpolation(action, interpolation: str):
+    fcurves = getattr(action, "fcurves", None)
+    if fcurves is None:
+        return
+    for fcurve in fcurves:
+        for point in fcurve.keyframe_points:
+            point.interpolation = interpolation
+
+
+def _apply_object_keyframes(obj, keys, node_id=None, transform_kind="OBJECT"):
+    obj.animation_data_create()
+    action = obj.animation_data.action
+    for key in keys:
+        frame = _animation_frame_from_ms(key.time)
+        if key.translation is not None:
+            obj.location = key.translation
+            _insert_vector_key(action, obj, "location", frame, obj.location,
+                               "Object")
+        if key.rotation is not None:
+            obj.rotation_mode = 'XYZ'
+            obj.rotation_euler = _i3d_rotation_to_blender_euler(key.rotation)
+            _insert_vector_key(action, obj, "rotation_euler", frame,
+                               obj.rotation_euler, "Object")
+        if key.scale is not None:
+            obj.scale = key.scale
+            _insert_vector_key(action, obj, "scale", frame, obj.scale,
+                               "Object")
+        _remember_i3d_key_transform(action, transform_kind, obj.name, node_id, frame, key)
+
+
+def _apply_bone_keyframes(arm_obj, bone_name: str, keys, rest_matrix=None,
+                          rest_transform=None,
+                          frame_offset: float = 0.0, node_id=None):
+    pose_bone = arm_obj.pose.bones.get(bone_name)
+    if pose_bone is None:
+        return
+
+    arm_obj.animation_data_create()
+    action = arm_obj.animation_data.action
+    pose_bone.rotation_mode = 'XYZ'
+    bone_path = _bone_data_path(bone_name)
+    for key in keys:
+        frame = frame_offset + _animation_frame_from_ms(key.time)
+        if rest_matrix is not None:
+            if rest_transform is not None:
+                rest_translation, rest_rotation, rest_scale = rest_transform
+            else:
+                rest_translation = rest_matrix.to_translation()
+                rest_rotation = tuple(
+                    math.degrees(v) for v in rest_matrix.to_euler('XYZ'))
+                rest_scale = rest_matrix.to_scale()
+            key_translation = key.translation if key.translation is not None else rest_translation
+            key_rotation = key.rotation if key.rotation is not None else rest_rotation
+            key_scale = key.scale if key.scale is not None else rest_scale
+            key_matrix = _i3d_local_matrix(key_translation, key_rotation, key_scale)
+            delta_matrix = (
+                rest_matrix.inverted() @ key_matrix
+            )
+            pose_bone.location = delta_matrix.to_translation()
+            pose_bone.rotation_euler = delta_matrix.to_euler('XYZ')
+            pose_bone.scale = delta_matrix.to_scale()
+            _insert_vector_key(action, arm_obj, f"{bone_path}.location",
+                               frame, pose_bone.location, bone_name)
+            _insert_vector_key(action, arm_obj, f"{bone_path}.rotation_euler",
+                               frame, pose_bone.rotation_euler, bone_name)
+            _insert_vector_key(action, arm_obj, f"{bone_path}.scale",
+                               frame, pose_bone.scale, bone_name)
+            _remember_i3d_key_transform(action, "BONE", bone_name, node_id, frame, key)
+            continue
+
+        if key.translation is not None:
+            pose_bone.location = key.translation
+            _insert_vector_key(action, arm_obj, f"{bone_path}.location",
+                               frame, pose_bone.location, bone_name)
+        if key.rotation is not None:
+            pose_bone.rotation_euler = _i3d_rotation_to_blender_euler(key.rotation)
+            _insert_vector_key(action, arm_obj, f"{bone_path}.rotation_euler",
+                               frame, pose_bone.rotation_euler, bone_name)
+        if key.scale is not None:
+            pose_bone.scale = key.scale
+            _insert_vector_key(action, arm_obj, f"{bone_path}.scale",
+                               frame, pose_bone.scale, bone_name)
+        _remember_i3d_key_transform(action, "BONE", bone_name, node_id, frame, key)
+
+
+def _bone_data_path(bone_name: str) -> str:
+    escaped = bone_name.replace('\\', '\\\\').replace('"', '\\"')
+    return f'pose.bones["{escaped}"]'
+
+
+def _remember_i3d_key_transform(action, kind, name, node_id, frame, keyframe):
+    """Store original I3D key TRS for exact exporter round-trips."""
+
+    if action is None or keyframe is None:
+        return
+    data = _I3D_KEY_ROTATION_CACHE.setdefault(id(action), {})
+    key = _i3d_key_rotation_id(kind, name, node_id, frame)
+    value = {}
+    if keyframe.translation is not None:
+        value["translation"] = [float(v) for v in keyframe.translation]
+    if keyframe.rotation is not None:
+        value["rotation"] = [float(v) for v in keyframe.rotation]
+    if keyframe.scale is not None:
+        value["scale"] = [float(v) for v in keyframe.scale]
+    if not value:
+        return
+    data[key] = value
+    data[_i3d_key_rotation_id(kind, name, None, frame)] = value
+
+
+def _flush_i3d_key_rotations(action):
+    data = _I3D_KEY_ROTATION_CACHE.pop(id(action), None)
+    if not data:
+        return
+    action["_i3d_keyframe_rotations"] = json.dumps(data, separators=(",", ":"))
+
+
+def _i3d_key_rotation_id(kind, name, node_id, frame):
+    node_part = "" if node_id is None else str(int(node_id))
+    return f"{kind}|{name}|{node_part}|{round(float(frame), 6):g}"
+
+
+def _insert_vector_key(action, datablock, data_path: str, frame: float,
+                       values, group_name: str):
+    if action is None:
+        return
+    for index, value in enumerate(values):
+        fcurve = _ensure_action_fcurve(
+            action, datablock, data_path, index, group_name)
+        if fcurve is None:
+            continue
+        point = fcurve.keyframe_points.insert(
+            frame, float(value), options={'FAST'})
+        point.interpolation = 'LINEAR'
+
+
+def _ensure_action_fcurve(action, datablock, data_path: str,
+                          index: int, group_name: str):
+    if hasattr(action, "fcurve_ensure_for_datablock"):
+        try:
+            return action.fcurve_ensure_for_datablock(
+                datablock, data_path, index=index, group_name=group_name)
+        except TypeError:
+            return action.fcurve_ensure_for_datablock(
+                datablock, data_path, index=index)
+
+    fcurves = getattr(action, "fcurves", None)
+    if fcurves is None:
+        return None
+    found = fcurves.find(data_path, index=index)
+    if found is not None:
+        return found
+    try:
+        return fcurves.new(data_path, index=index, action_group=group_name)
+    except TypeError:
+        return fcurves.new(data_path, index=index)
+
+
+def _animation_frame_from_ms(time_ms: float) -> float:
+    fps = bpy.context.scene.render.fps or 30
+    return 1.0 + (float(time_ms) * float(fps) / 1000.0)
+
+
+def _animation_duration_frames(duration_ms: float) -> float:
+    fps = bpy.context.scene.render.fps or 30
+    return max(1.0, float(duration_ms) * float(fps) / 1000.0)
+
+
+def _fit_scene_frame_range(animation_sets):
+    max_frame = 1.0
+    for anim_set in animation_sets:
+        for clip in anim_set.clips:
+            duration = _animation_duration_frames(clip.duration)
+            max_frame = max(max_frame, 1.0 + duration)
+    try:
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = max(int(math.ceil(max_frame)), 1)
+    except Exception:
+        pass
+
+
+def _i3d_rotation_to_blender_euler(rotation_deg):
+    import mathutils
+    xml_euler = mathutils.Euler((
+        math.radians(rotation_deg[0]),
+        math.radians(rotation_deg[1]),
+        math.radians(rotation_deg[2]),
+    ), 'XYZ')
+    R_xml = xml_euler.to_matrix().to_4x4()
+    M = mathutils.Matrix.Rotation(math.radians(90), 4, 'X')
+    return (M @ R_xml @ M.inverted()).to_euler('XYZ')
+
+
+def _i3d_local_matrix(translation, rotation_deg, scale):
+    import mathutils
+    translation_matrix = mathutils.Matrix.Translation(translation)
+    rotation_matrix = mathutils.Euler((
+        math.radians(rotation_deg[0]),
+        math.radians(rotation_deg[1]),
+        math.radians(rotation_deg[2]),
+    ), 'XYZ').to_matrix().to_4x4()
+    scale_matrix = (
+        mathutils.Matrix.Scale(scale[0], 4, (1, 0, 0)) @
+        mathutils.Matrix.Scale(scale[1], 4, (0, 1, 0)) @
+        mathutils.Matrix.Scale(scale[2], 4, (0, 0, 1))
+    )
+    return translation_matrix @ rotation_matrix @ scale_matrix
+
+
+# ---------------------------------------------------------------------------
 # Path resolution + image loading
 # ---------------------------------------------------------------------------
+
+def _existing_texture_path(candidate: Path) -> Optional[Path]:
+    """Return an existing texture path, preferring same-name DDS for PNG refs."""
+    if candidate.suffix.lower() == '.png':
+        dds_candidate = candidate.with_suffix('.dds')
+        if dds_candidate.exists():
+            return dds_candidate
+
+    if candidate.exists():
+        return candidate
+    return None
+
 
 def _resolve_filepath(filename: str, i3d_dir: Path) -> Optional[Path]:
     """
@@ -2109,13 +2913,9 @@ def _resolve_filepath(filename: str, i3d_dir: Path) -> Optional[Path]:
         else:
             candidate = i3d_dir / filename
 
-    if candidate.suffix.lower() == '.png':
-        dds_candidate = candidate.with_suffix('.dds')
-        if dds_candidate.exists():
-            return dds_candidate
-
-    if candidate.exists():
-        return candidate
+    resolved = _existing_texture_path(candidate)
+    if resolved is not None:
+        return resolved
     return None
 
 
@@ -2543,7 +3343,8 @@ def _finalize_skin_childof(import_collection, report):
             pass
 
 
-def _process_skin_weights(import_collection, shape_map, shape_id_to_obj, report):
+def _process_skin_weights(import_collection, shape_map, shape_id_to_obj, report,
+                          use_shared_armatures=False):
     """For Skin-Weights shapes (4 weighted bones per vertex), reproduce the
     original embedded-joint hierarchy on re-export through the Giants exporter
     (#6). Strategy:
@@ -2715,6 +3516,17 @@ def _process_skin_weights(import_collection, shape_map, shape_id_to_obj, report)
         con.target = info['parent']
         con.mute = True
 
+    arm_obj['userAttribute_string_skinBoneMap'] = ';'.join(
+        f"{bone_name_of[nid]}:{int(nid)}"
+        for nid in unique_joint_ids
+        if nid in bone_name_of
+    )
+    arm_obj['userAttribute_string_skinBoneOriginalNames'] = ','.join(
+        joint_info[nid]['name']
+        for nid in unique_joint_ids
+        if nid in joint_info and nid in bone_name_of
+    )
+
     # ---- Preserve removed-joint userAttributes (e.g. liw) on the armature ----
     preserved = {}
     for nid in unique_joint_ids:
@@ -2786,17 +3598,34 @@ def _process_skin_weights(import_collection, shape_map, shape_id_to_obj, report)
                f"({len(vg_map)} bone(s), {weight_count} weight(s))")
 
     # ---- Remove the now-duplicate source joint Empties ----
+    removed_joint_ids = set(unique_joint_ids)
+    reparent_target_by_id = {}
+    for nid in unique_joint_ids:
+        info = joint_info.get(nid)
+        parent = info['parent'] if info else None
+        while parent is not None:
+            try:
+                parent_nid = int(parent.get('_i3d_nodeId'))
+            except (TypeError, ValueError):
+                break
+            if parent_nid not in removed_joint_ids:
+                break
+            parent = parent.parent
+        reparent_target_by_id[nid] = parent
+
     removed = 0
     for nid in unique_joint_ids:
         info = joint_info.get(nid)
         if not info or info['src'] is None:
             continue
         src = info['src']
-        parent = info['parent']
+        parent = reparent_target_by_id.get(nid)
         # Re-parent any children up to the joint's parent, keeping world
         # transform (precea joints are leaves; this is defensive).
         for child in list(src.children):
             mw = child.matrix_world.copy()
+            if parent is not None and parent.name not in _bpy.data.objects:
+                parent = None
             child.parent = parent
             child.matrix_world = mw
         try:
