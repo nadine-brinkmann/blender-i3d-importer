@@ -12,7 +12,7 @@ Decodes the *.i3d.shapes binary directly in Python — no external tool needed.
 bl_info = {
     "name": "i3d Importer",
     "author": "Nadine Brinkmann",
-    "version": (0, 2, 0),
+    "version": (0, 4, 0),
     "blender": (5, 1, 0),
     "location": "File > Import > Farming Simulator i3d (.i3d)",
     "description": (
