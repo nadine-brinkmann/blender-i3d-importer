@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "blender_i3d_importer"
-version = "0.3.2"
+version = "0.3.3"
 name = "i3d Importer"
 tagline = "Import Farming Simulator 22 and 25 .i3d files into Blender"
 maintainer = "Nadine Brinkmann <nadinebrinkmann.yt@gmail.com>"
@@ -25,7 +25,7 @@ copyright = [
 platforms = ["windows-x64"]
 
 [permissions]
-files = "Read i3d files, textures, and shader XMLs from disk; write temporary OBJx files during import"
+files = "Read i3d, texture and shader files; write temp import files"
 
 [build]
 paths_exclude_pattern = [

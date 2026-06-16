@@ -456,6 +456,182 @@ class FS25_OT_switch_materials(Operator):
         return {'FINISHED'}
 
 
+class FS25_OT_prepare_for_community_exporter(Operator):
+    """Mirror the Giants-style re-export custom properties (customShader,
+    customShaderVariation, customParameter_*, customTexture_*) into the
+    community 'GIANTS I3D Community Exporter' addon's material.i3d_attributes,
+    so imported models also round-trip through that exporter.
+
+    The official Giants exporter reads textures/shader data from material
+    custom IDProperties (which the importer already writes). The community
+    exporter instead reads its own material.i3d_attributes PropertyGroup and
+    the Principled BSDF sockets. This operator bridges the former into the
+    latter for the selected meshes' materials (or all i3d materials when
+    nothing is selected). Run it after switching slots to the Export
+    materials (the debug materials carry no re-export properties).
+
+    Safe to re-run; it overwrites only the bridged fields.
+    """
+    bl_idname = "fs25.prepare_for_community_exporter"
+    bl_label = "Prepare for Community Exporter"
+    bl_options = {'UNDO'}
+
+    @staticmethod
+    def _gather_materials(context):
+        mats = []
+        seen = set()
+        sel_meshes = [o for o in context.selected_objects
+                      if o.type == 'MESH' and o.data]
+        if sel_meshes:
+            for obj in sel_meshes:
+                for slot in obj.material_slots:
+                    m = slot.material
+                    if m is not None and m.name not in seen:
+                        seen.add(m.name)
+                        mats.append(m)
+        else:
+            for m in bpy.data.materials:
+                if (m.get('_i3d_material_id') is not None
+                        and m.get('_i3d_material_kind') == 'export'
+                        and m.name not in seen):
+                    seen.add(m.name)
+                    mats.append(m)
+        return mats
+
+    @staticmethod
+    def _rename_glossmap_node(mat):
+        """Label the image node feeding Principled 'Roughness' as 'glossmap'
+        so the community exporter (which reads gloss from the Specular socket
+        or a node named/labelled 'glossmap') picks it up. Giants ignores node
+        names, so this is harmless for that path. Returns True if relabelled."""
+        nt = mat.node_tree
+        if nt is None:
+            return False
+        bsdf = next((n for n in nt.nodes if n.type == 'BSDF_PRINCIPLED'), None)
+        if bsdf is None or 'Roughness' not in bsdf.inputs:
+            return False
+        sock = bsdf.inputs['Roughness']
+        if not sock.is_linked:
+            return False
+        src = sock.links[0].from_node
+        if src.type != 'TEX_IMAGE':
+            return False
+        src.label = 'glossmap'
+        if src.name.lower() != 'glossmap':
+            src.name = 'glossmap'
+        return True
+
+    def _bridge_material(self, mat):
+        """Returns (status, detail). status in {'ok','no_shader','partial','skip'}."""
+        attrs = mat.i3d_attributes  # caller guarantees the attribute exists
+
+        # Standard gloss discoverability (independent of custom shader).
+        self._rename_glossmap_node(mat)
+
+        shader_path = mat.get('customShader')
+        if not shader_path:
+            # Plain material: BSDF Base Color / Normal already export via the
+            # community exporter's PrincipledBSDFWrapper; gloss handled above.
+            return ('skip', 'no customShader')
+
+        shader_stem = os.path.splitext(os.path.basename(str(shader_path)))[0]
+
+        # Game shader mode (importer materials reference $data/shaders/*).
+        if attrs.use_custom_shaders:
+            attrs.use_custom_shaders = False
+
+        # Setting shader_name runs the community addon's ShaderManager, which
+        # populates variations/params/textures. If the shader isn't in the
+        # addon's known set (FS data path not configured, or unknown shader),
+        # the setter resets the name back to '' — detect that.
+        attrs.shader_name = shader_stem
+        if attrs.shader_name != shader_stem:
+            return ('no_shader',
+                    f"shader '{shader_stem}' not found by the community addon "
+                    f"(check its FS data path / installed shaders)")
+
+        # Variation (must be set AFTER shader_name so the variation list exists).
+        variation = mat.get('customShaderVariation')
+        if variation:
+            attrs.shader_variation_name = str(variation)
+
+        # Custom parameters -> shader_material_params (only where the param
+        # exists for this shader/variation and the value count matches).
+        params = attrs.shader_material_params
+        param_keys = set(params.keys())
+        applied_params = 0
+        for key in list(mat.keys()):
+            if not key.startswith('customParameter_'):
+                continue
+            pname = key[len('customParameter_'):]
+            if pname not in param_keys:
+                continue
+            try:
+                vals = [float(x) for x in str(mat[key]).split()]
+            except ValueError:
+                continue
+            try:
+                cur_len = len(params[pname])
+            except TypeError:
+                cur_len = 1
+            if vals and len(vals) == cur_len:
+                params[pname] = vals
+                applied_params += 1
+
+        # Custom textures -> shader_material_textures[*].source.
+        tex_by_name = {t.name: t for t in attrs.shader_material_textures}
+        applied_tex = 0
+        for key in list(mat.keys()):
+            if not key.startswith('customTexture_'):
+                continue
+            tname = key[len('customTexture_'):]
+            tex = tex_by_name.get(tname)
+            src = str(mat[key])
+            if tex is not None and src:
+                tex.source = src
+                applied_tex += 1
+
+        return ('ok',
+                f"shader='{shader_stem}'"
+                + (f" var='{variation}'" if variation else "")
+                + f", {applied_params} param(s), {applied_tex} texture(s)")
+
+    def execute(self, context):
+        mats = self._gather_materials(context)
+        if not mats:
+            self.report({'WARNING'}, "No i3d materials found "
+                                     "(select imported meshes, or import first)")
+            return {'CANCELLED'}
+
+        # Community addon registers i3d_attributes on bpy.types.Material.
+        if not hasattr(mats[0], 'i3d_attributes'):
+            self.report({'ERROR'},
+                        "Community 'GIANTS I3D Community Exporter' addon not "
+                        "installed/enabled — material.i3d_attributes missing")
+            return {'CANCELLED'}
+
+        n_ok = n_noshader = n_skip = 0
+        for mat in mats:
+            try:
+                status, detail = self._bridge_material(mat)
+            except Exception as e:  # never let one material abort the batch
+                self.report({'WARNING'}, f"'{mat.name}': {e}")
+                continue
+            if status == 'ok':
+                n_ok += 1
+            elif status == 'no_shader':
+                n_noshader += 1
+                self.report({'WARNING'}, f"'{mat.name}': {detail}")
+            else:
+                n_skip += 1
+
+        self.report({'INFO'},
+                    f"Community export prep: {n_ok} bridged, "
+                    f"{n_noshader} shader-not-found, {n_skip} skipped "
+                    f"(of {len(mats)} material(s))")
+        return {'FINISHED'}
+
+
 def _serialize_param_group(slots):
     """Combine a sync param group into a single customParameter_*
     string value. slots is a dict slot_name -> (node, mode).
@@ -623,6 +799,13 @@ class FS25_PT_i3d_importer_panel(bpy.types.Panel):
         row = box.row()
         op_tog = row.operator("fs25.switch_materials", text="Toggle", icon='ARROW_LEFTRIGHT')
         op_tog.target_kind = 'toggle'
+
+        # Community exporter round-trip section
+        box = layout.box()
+        box.label(text="Community Exporter", icon='EXPORT')
+        box.label(text="Bridge i3d props -> i3d_attributes:")
+        box.operator("fs25.prepare_for_community_exporter",
+                     text="Prepare for Community Exporter")
 
 
 class FS25_PT_material_settings(bpy.types.Panel):
@@ -955,6 +1138,7 @@ def register():
     bpy.utils.register_class(FS25I3DImporterPreferences)
     bpy.utils.register_class(IMPORT_OT_fs25_i3d)
     bpy.utils.register_class(FS25_OT_switch_materials)
+    bpy.utils.register_class(FS25_OT_prepare_for_community_exporter)
     bpy.utils.register_class(FS25_OT_snow_heaps_show)
     bpy.utils.register_class(FS25_OT_snow_heaps_hide)
     bpy.utils.register_class(FS25_OT_invisible_ge_show)
@@ -1001,6 +1185,7 @@ def unregister():
     bpy.utils.unregister_class(FS25_OT_invisible_ge_show)
     bpy.utils.unregister_class(FS25_OT_snow_heaps_hide)
     bpy.utils.unregister_class(FS25_OT_snow_heaps_show)
+    bpy.utils.unregister_class(FS25_OT_prepare_for_community_exporter)
     bpy.utils.unregister_class(FS25_OT_switch_materials)
     bpy.utils.unregister_class(IMPORT_OT_fs25_i3d)
     bpy.utils.unregister_class(FS25I3DImporterPreferences)
