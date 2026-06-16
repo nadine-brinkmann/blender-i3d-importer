@@ -1292,6 +1292,112 @@ def build_pbr_debug_material(
                      for cp in mat_attrs.get('_customparameters', [])
                      if cp.get('name') and cp.get('value') is not None}
 
+    # ---- treeBranchShader (SEASONAL): leaf/branch debug visualization ------
+    # The seasonal tree-branch shader packs 4 seasons into the baseMap atlas
+    # (shader uvScale=0.5 -> a 0.5x0.5 quadrant) and derives the look from
+    # mMaskMap (R=branches, G=leaves-grow, B=random-per-leaf). cShared3 (0..4)
+    # picks the season at runtime; for a static debug we show SUMMER:
+    #   summer leaf color : baseMap uv*0.5 + (0.5,0.5)
+    #   branch color      : baseMap uv*0.5 + (0.5,0.0)   (mColorBranches)
+    #   diffuse = mix(branch, summer, mask.G)            (G high = leaf -> green)
+    #   alpha   = (mask.R + mask.G) > 0.25               (binary cutout)
+    #   mMaskMap is a single image -> sampled at full uv (Mapping scale 1.0).
+    # Re-export material is untouched; debug look only. Season switch can drive
+    # the quadrant offsets later. See GitHub #22.
+    if _tp_shader_name == 'treebranchshader.xml' and base_color_source is not None:
+        def _ensure_mapping(tex_node, scale_xy, loc_xy, y):
+            vec = tex_node.inputs.get('Vector') if hasattr(tex_node, 'inputs') else None
+            mp = None
+            if vec is not None and vec.is_linked:
+                src = vec.links[0].from_node
+                if src.type == 'MAPPING':
+                    mp = src
+            if mp is None:
+                uvn = nt.nodes.new('ShaderNodeUVMap'); uvn.uv_map = 'UVMap'
+                uvn.location = (tex_node.location.x - 600, y)
+                mp = nt.nodes.new('ShaderNodeMapping')
+                mp.location = (tex_node.location.x - 350, y)
+                nt.links.new(uvn.outputs['UV'], mp.inputs['Vector'])
+                if vec is not None:
+                    nt.links.new(mp.outputs['Vector'], vec)
+            mp.inputs['Scale'].default_value = (scale_xy[0], scale_xy[1], 1.0)
+            mp.inputs['Location'].default_value = (loc_xy[0], loc_xy[1], 0.0)
+            return mp
+
+        _summer_tex = base_color_source.node
+        _mask = cm_tex.get('mMaskMap')
+        # leaf-diffuse quadrant on the existing baseMap node (default summer);
+        # the N-Panel 'Tree Season' control drives this Mapping's offset.
+        _leaf_map = _ensure_mapping(_summer_tex, (0.5, 0.5), (0.5, 0.5), 350)
+        _leaf_map.label = 'i3d_tree_leaf_quadrant'
+
+        if _mask is not None and getattr(_summer_tex, 'image', None) is not None:
+            # mask channels (single image -> full uv)
+            _ensure_mapping(_mask, (1.0, 1.0), (0.0, 0.0), -250)
+            _sep = nt.nodes.new('ShaderNodeSeparateColor')
+            _sep.location = (-300, -250)
+            nt.links.new(_mask.outputs['Color'], _sep.inputs['Color'])
+
+            # 'leaves enabled' (1 normally, 0 in winter) - driven by the
+            # N-Panel 'Tree Season' control. G_eff = mask.G * leaf_enable
+            # feeds BOTH the diffuse leaf/branch mix and the leaf alpha, so
+            # winter -> all branches + branches-only cutout.
+            _leaf_en = nt.nodes.new('ShaderNodeValue')
+            _leaf_en.outputs[0].default_value = 1.0
+            _leaf_en.label = 'i3d_tree_leaf_enable'
+            _leaf_en.location = (-300, -120)
+            _genable = nt.nodes.new('ShaderNodeMath')
+            _genable.operation = 'MULTIPLY'
+            _genable.location = (-120, -120)
+            _genable.label = 'G_eff = leaves * season-enable'
+            nt.links.new(_sep.outputs['Green'], _genable.inputs[0])
+            nt.links.new(_leaf_en.outputs[0], _genable.inputs[1])
+
+            # second baseMap sample at the branches quadrant (0.5, 0.0)
+            _branch_tex = nt.nodes.new('ShaderNodeTexImage')
+            _branch_tex.image = _summer_tex.image
+            _branch_tex.interpolation = _summer_tex.interpolation
+            _branch_tex.location = (_summer_tex.location.x, _summer_tex.location.y + 330)
+            _branch_tex.label = 'baseMap (branches quadrant)'
+            _ensure_mapping(_branch_tex, (0.5, 0.5), (0.5, 0.0), _branch_tex.location.y)
+
+            # diffuse = mix(branch, summer, mask.G): G high -> leaf (summer green)
+            _dmix = nt.nodes.new('ShaderNodeMix'); _dmix.data_type = 'RGBA'
+            _dmix.location = (-60, 360); _dmix.label = 'branch/leaf diffuse (summer)'
+            nt.links.new(_genable.outputs[0], _dmix.inputs['Factor'])
+            nt.links.new(_branch_tex.outputs['Color'], _dmix.inputs[6])  # A = branches
+            nt.links.new(_summer_tex.outputs['Color'], _dmix.inputs[7])  # B = summer leaves
+            base_color_source = _dmix.outputs[2]
+
+            # binary alpha cutout = (R + G) > 0.25 (ALPHA_TESTED, render-method
+            # independent; blend_method is deprecated in 4.2+/5.x)
+            _add = nt.nodes.new('ShaderNodeMath')
+            _add.operation = 'ADD'; _add.use_clamp = True
+            _add.location = (-100, -250)
+            _add.label = 'R(branches)+G(leaves)'
+            nt.links.new(_sep.outputs['Red'], _add.inputs[0])
+            nt.links.new(_genable.outputs[0], _add.inputs[1])
+            _bin = nt.nodes.new('ShaderNodeMath')
+            _bin.operation = 'GREATER_THAN'
+            _bin.inputs[1].default_value = 0.25
+            _bin.location = (80, -250)
+            _bin.label = 'leaf alpha cutout (binary)'
+            nt.links.new(_add.outputs[0], _bin.inputs[0])
+            for _l in list(bsdf.inputs['Alpha'].links):
+                nt.links.remove(_l)
+            nt.links.new(_bin.outputs[0], bsdf.inputs['Alpha'])
+            mat.blend_method = 'CLIP'
+            try:
+                mat.alpha_threshold = 0.25
+            except AttributeError:
+                pass
+            composited_features.append('treeBranchSeasonal')
+            mat['_i3d_tree_branch_debug'] = True
+        else:
+            report('INFO',
+                   f"PBR debug '{mat_name}': treeBranchShader without mMaskMap "
+                   f"- leaf cutout / branch-color skipped.")
+
     # ---- 6b. FS22 vehicleShader colorMask palette (Teil 1) ----------------
     # FS22 vehicles have no diffuse <Texture>; the base colour comes from the
     # colorMat0..7 palette selected per-fragment by UV0: when uv.y < 0 the colour
@@ -2507,9 +2613,14 @@ def _make_image_chain(
             label_suffix=f"for {texture_name}")
     else:
         if uv_type == 'custom':
-            report('WARNING',
+            # 'custom' = the shader computes these UVs internally (e.g.
+            # mSeasonalCurve sampled by season, not a mesh UV). We can't
+            # reproduce that from a mesh UV layer, so we fall back to
+            # UVMap as a placeholder. This is an expected limitation, not
+            # an error -> INFO, so it doesn't inflate the warning count.
+            report('INFO',
                    f"PBR debug '{mat_name}': '{texture_name}' uvType='custom' "
-                   f"- falling back to UVMap, check manually.")
+                   f"(shader-computed) - using UVMap as a placeholder.")
             blender_uv = 'UVMap'
         else:
             blender_uv = GIANTS_UV_TO_BLENDER_UV.get(uv_type, 'UVMap')

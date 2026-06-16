@@ -176,6 +176,18 @@ class EntityType(IntEnum):
 def _type_to_enum(t: int) -> EntityType:
     if t == 1:
         return EntityType.SHAPE
+    # Entity types 4 and 5 are tree-shape variants (e.g.
+    # data/maps/trees/.../oak_stage05), both using the I3DShape layout:
+    #   - type 4 = LOD0 trunk mesh (standard layout + trailing tree data we
+    #     skip). Verified: oak LOD0Shape -> 1545 verts / 2410 tris.
+    #   - type 5 = LOD attachments (leaf / small-branch planes). Same layout
+    #     but with NO bounding-volume Vector4 at the body start;
+    #     parse_shape_entity handles that via raw_entity.type. Verified: oak
+    #     LOD0AttachmentsShape -> 31248 verts / 18732 tris (+ generic).
+    # Both match the Giants Editor Mesh Viewer. Without this the detailed
+    # trunk and the leaves are silently dropped (GitHub #22).
+    if t in (4, 5):
+        return EntityType.SHAPE
     if t == 2:
         return EntityType.SPLINE
     if t == 6:

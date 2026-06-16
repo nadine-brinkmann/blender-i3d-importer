@@ -649,6 +649,13 @@ class FS25_PT_i3d_importer_panel(bpy.types.Panel):
         op_tog = row.operator("fs25.switch_materials", text="Toggle", icon='ARROW_LEFTRIGHT')
         op_tog.target_kind = 'toggle'
 
+        # Tree season - shown only when the file actually has a
+        # tree-branch debug material (treeBranchShader SEASONAL).
+        if any(m.get('_i3d_tree_branch_debug') for m in bpy.data.materials):
+            box = layout.box()
+            box.label(text="Tree Season")
+            box.prop(context.scene, "fs25_tree_season", text="")
+
 
 class FS25_PT_material_settings(bpy.types.Panel):
     """Sub-panel showing FS25 custom-parameter sliders for the active material.
@@ -975,6 +982,35 @@ def menu_func_import(self, context):
     self.layout.operator(IMPORT_OT_fs25_i3d.bl_idname, text="Farming Simulator i3d (.i3d)")
 
 
+# --- Tree season control (treeBranchShader SEASONAL debug materials) -------
+# Season -> (leaf-diffuse quadrant offset, leaves-enabled). The leaf-quadrant
+# Mapping and the 'leaf enable' Value node are tagged by label in the debug
+# material (recipe_loader treeBranchShader block).
+_TREE_SEASON_PRESETS = {
+    'SUMMER': ((0.5, 0.5), 1.0),
+    'AUTUMN': ((0.0, 0.0), 1.0),
+    'WINTER': ((0.5, 0.0), 0.0),   # leaves off -> branches only; offset irrelevant
+    'SPRING': ((0.0, 0.5), 1.0),
+}
+
+
+def _update_tree_season(self, context):
+    """Switch all FS25 tree-branch debug materials to the chosen season."""
+    season = getattr(context.scene, 'fs25_tree_season', 'SUMMER')
+    offset, leaf_enable = _TREE_SEASON_PRESETS.get(season, ((0.5, 0.5), 1.0))
+    for mat in bpy.data.materials:
+        if not mat.get('_i3d_tree_branch_debug'):
+            continue
+        nt = mat.node_tree
+        if nt is None:
+            continue
+        for n in nt.nodes:
+            if n.type == 'MAPPING' and n.label == 'i3d_tree_leaf_quadrant':
+                n.inputs['Location'].default_value = (offset[0], offset[1], 0.0)
+            elif n.type == 'VALUE' and n.label == 'i3d_tree_leaf_enable':
+                n.outputs[0].default_value = leaf_enable
+
+
 def register():
     bpy.utils.register_class(FS25_OT_terrain_base_color_reset)
     bpy.utils.register_class(FS25I3DImporterPreferences)
@@ -1009,11 +1045,28 @@ def register():
         default=False,
         update=_on_debug_mode_change,
     )
+    bpy.types.Scene.fs25_tree_season = EnumProperty(
+        name="Tree Season",
+        description="Season shown by FS25 tree-branch debug materials "
+                    "(treeBranchShader SEASONAL): switches the leaf diffuse "
+                    "quadrant and toggles leaves (Winter = branches only). "
+                    "Debug visualization only - the re-export material is "
+                    "unaffected.",
+        items=[
+            ('SUMMER', "Summer", "Full green leaves"),
+            ('AUTUMN', "Autumn", "Autumn-coloured leaves"),
+            ('WINTER', "Winter", "No leaves (branches only)"),
+            ('SPRING', "Spring", "Spring leaves"),
+        ],
+        default='SUMMER',
+        update=_update_tree_season,
+    )
     bpy.types.TOPBAR_MT_file_import.append(menu_func_import)
 
 
 def unregister():
     bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)
+    del bpy.types.Scene.fs25_tree_season
     del bpy.types.Scene.fs25_debug_only_active
     del bpy.types.Scene.fs25_debug_mode
     bpy.utils.unregister_class(FS25_PT_debug_view)

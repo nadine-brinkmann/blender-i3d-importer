@@ -325,6 +325,10 @@ class Shape:
         self.options_high_bits = 0
         self.vtx_compression = None  # only set for file_version >= 10
         self.unread_bytes = 0  # set if the reader did not consume all input
+        # Container entity type (i3d_shapes_reader): 1 = standard shape,
+        # 4/5 = tree-shape variants (LOD0 mesh / LOD attachments). Used to
+        # gate MergedChildren splitting (only type 1 is a candidate).
+        self.entity_type_int = 1
 
     @property
     def vertex_count(self) -> int:
@@ -391,9 +395,18 @@ def parse_shape_entity(raw_entity, file_version: int) -> Shape:
     sh = Shape()
     sh.name, sh.id = _read_part_header(r)
     sh.file_version = file_version
+    sh.entity_type_int = getattr(raw_entity, "type", 1)
 
     # ----- ReadContents (I3DShape.cs:84+) -----
-    sh.bounding_volume = Vector4.read(r)
+    # Entity type 5 (tree LOD attachments / leaf planes) uses the standard
+    # I3DShape body layout EXCEPT it has no bounding-volume Vector4 at the
+    # start. Reading one shifts every field by 16 bytes (verified on
+    # oak_stage05: skipping it -> 31248 verts / 18732 tris matching the GE
+    # Mesh Viewer; reading it -> garbage 675 verts / 0 tris). GitHub #22.
+    if getattr(raw_entity, "type", None) == 5:
+        sh.bounding_volume = None
+    else:
+        sh.bounding_volume = Vector4.read(r)
     corner_count = r.read_uint32()
     num_subsets = r.read_uint32()
     vertex_count = r.read_uint32()

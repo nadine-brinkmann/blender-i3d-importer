@@ -2208,6 +2208,22 @@ def _process_merge_children(import_collection, shape_map, shape_id_to_obj, repor
         if mesh_obj is None:
             continue
 
+        # MergedChildren only ever comes from a STANDARD shape (container
+        # entity type 1) that the Giants exporter produced from a Blender
+        # i3D_mergeChildren group, where g = child_index / 32767. Tree shapes
+        # use other entity types - type 5 (LOD attachments) carries generic
+        # 'g' that is CONTINUOUS leaf/branch attachment-reference data, NOT a
+        # child grouping. Splitting it by round(g*32767) shatters the mesh into
+        # thousands of 1-2 vertex fragments (the 'black cubes' in GitHub #22).
+        # So only type-1 shapes are MergedChildren candidates.
+        if getattr(shape, 'entity_type_int', 1) != 1:
+            report('INFO',
+                   f"{mesh_obj.name}: generic data on a non-standard shape "
+                   f"(entity type {getattr(shape, 'entity_type_int', '?')}) "
+                   f"kept as a single mesh, not split as MergedChildren "
+                   f"(e.g. tree leaf attachments).")
+            continue
+
         # Compute unique g slots from generic_data.
         # The exporter writes g = child_index / 32767, so round-trip gives the
         # original integer slot number.
