@@ -2243,6 +2243,21 @@ def _process_merge_children(import_collection, shape_map, shape_id_to_obj, repor
             for t in range(max(0, first_tri), min(len(shape.triangles), last_tri)):
                 global_face_subset[t] = subset_idx
 
+        def _slot_local(slot, g):
+            """Local index of global vert `g` within `slot`, adding it if absent.
+            Keeps per_slot_verts[slot] and global_to_local[slot] in sync. The old
+            setdefault-without-append left cross-slot verts dangling (index pointed
+            one-past-the-end, and two new verts in one triangle collided on the
+            same index) -> out-of-range loop -> read access violation in
+            normals_split_custom_set_from_vertices (Blender crash on import)."""
+            m = global_to_local[slot]
+            li = m.get(g)
+            if li is None:
+                li = len(per_slot_verts[slot])
+                per_slot_verts[slot].append(g)
+                m[g] = li
+            return li
+
         per_slot_tris = [[] for _ in range(num_slots)]
         per_slot_face_subsets = [[] for _ in range(num_slots)]
         cross_tri_count = 0
@@ -2261,10 +2276,7 @@ def _process_merge_children(import_collection, shape_map, shape_id_to_obj, repor
                 cross_tri_count += 1
                 # Fall back to first vertex's slot
                 target = sl1 if sl1 is not None else 0
-                local = tuple(
-                    global_to_local[target].setdefault(g, len(per_slot_verts[target]))
-                    for g in (g1, g2, g3)
-                )
+                local = tuple(_slot_local(target, g) for g in (g1, g2, g3))
                 per_slot_tris[target].append(local)
                 per_slot_face_subsets[target].append(global_face_subset[tri_idx])
 
@@ -2290,8 +2302,13 @@ def _process_merge_children(import_collection, shape_map, shape_id_to_obj, repor
                 report('WARNING', f"Merge-child mesh '{name}': {_oor} face(s) with out-of-range "
                                    f"vertex indices removed — possible decoder error.")
             mdb.from_pydata(verts, [], tris)
-            mdb.validate(clean_customdata=False)  # logging done above via pre-scan
             mdb.update(calc_edges=True)
+            # NOTE: material_index / UV / color are assigned by positional
+            # poly_idx, so they MUST run BEFORE validate() — validate removes
+            # degenerate faces and renumbers mesh.polygons, which would shift
+            # every face after the first removed triangle onto the wrong
+            # material (visible as miscoloured triangles in debug view).
+            # Matches the ordering in _build_mesh_datablock.
             used = sorted(set(face_subsets))
             remap = {s: i for i, s in enumerate(used)}
             for subset_idx in used:
@@ -2324,6 +2341,9 @@ def _process_merge_children(import_collection, shape_map, shape_id_to_obj, repor
                         global_v = vert_idxs[loop.vertex_index]
                         c = shape.vertex_colors[global_v]
                         color_layer.data[loop_idx].color = (c.x, c.y, c.z, c.w)
+            # validate() after material/UV/color setup (removes degenerate
+            # geometry) and BEFORE custom normals (needs a clean mesh).
+            mdb.validate(clean_customdata=False)  # logging done above via pre-scan
             # Custom split normals (GitHub #1/#7), remapped to local verts.
             if shape.normals is not None:
                 _apply_custom_split_normals(
@@ -2895,6 +2915,22 @@ def _process_merge_groups(import_collection, shape_map, shape_id_to_obj, report)
             for t in range(max(0, first_tri), min(len(shape.triangles), last_tri)):
                 global_face_subset[t] = subset_idx
 
+        def _slot_local(slot, g):
+            """Local index of global vert `g` within `slot`, adding it if absent.
+            Keeps per_slot_verts[slot] and global_to_local[slot] in sync. The old
+            cross-slot path used setdefault(g, len(per_slot_verts[slot])) WITHOUT
+            appending, so the index pointed one-past-the-end (and two new verts
+            in one triangle collided on the same index). That dangling vertex
+            reference produced an out-of-range loop -> read access violation in
+            normals_split_custom_set_from_vertices (Blender crash on import)."""
+            m = global_to_local[slot]
+            li = m.get(g)
+            if li is None:
+                li = len(per_slot_verts[slot])
+                per_slot_verts[slot].append(g)
+                m[g] = li
+            return li
+
         per_slot_tris = [[] for _ in range(num_slots)]
         per_slot_face_subsets = [[] for _ in range(num_slots)]
         cross_tri_count = 0
@@ -2903,6 +2939,15 @@ def _process_merge_groups(import_collection, shape_map, shape_id_to_obj, report)
             s1 = shape.blend_indices[g1][0]
             s2 = shape.blend_indices[g2][0]
             s3 = shape.blend_indices[g3][0]
+            # Clamp to a valid slot, mirroring the per-vertex clamp above
+            # (line where slot >= num_slots -> 0); otherwise global_to_local[s1]
+            # would IndexError on a stray out-of-range blend index.
+            if s1 >= num_slots:
+                s1 = 0
+            if s2 >= num_slots:
+                s2 = 0
+            if s3 >= num_slots:
+                s3 = 0
             if s1 == s2 == s3:
                 local = (global_to_local[s1][g1],
                          global_to_local[s1][g2],
@@ -2911,9 +2956,9 @@ def _process_merge_groups(import_collection, shape_map, shape_id_to_obj, report)
                 per_slot_face_subsets[s1].append(global_face_subset[tri_idx])
             else:
                 cross_tri_count += 1
-                local = (global_to_local[s1][g1],
-                         global_to_local[s1].setdefault(g2, len(per_slot_verts[s1])),
-                         global_to_local[s1].setdefault(g3, len(per_slot_verts[s1])))
+                local = (_slot_local(s1, g1),
+                         _slot_local(s1, g2),
+                         _slot_local(s1, g3))
                 per_slot_tris[s1].append(local)
                 per_slot_face_subsets[s1].append(global_face_subset[tri_idx])
 
@@ -2946,8 +2991,13 @@ def _process_merge_groups(import_collection, shape_map, shape_id_to_obj, report)
                 report('WARNING', f"Merge-group slot mesh '{name}': {_oor} face(s) with out-of-range "
                                    f"vertex indices removed — possible decoder error.")
             mdb.from_pydata(verts, [], slot_tri_locals)
-            mdb.validate(clean_customdata=False)  # logging done above via pre-scan
             mdb.update(calc_edges=True)
+            # NOTE: material_index / UV / color are assigned by positional
+            # poly_idx, so they MUST run BEFORE validate() — validate removes
+            # degenerate faces and renumbers mesh.polygons, which would shift
+            # every face after the first removed triangle onto the wrong
+            # material (visible as miscoloured triangles in debug view).
+            # Matches the ordering in _build_mesh_datablock.
 
             # ---- Materials (only used subsets) ----
             used = sorted(set(slot_face_subsets))
@@ -2988,6 +3038,9 @@ def _process_merge_groups(import_collection, shape_map, shape_id_to_obj, report)
                         c = shape.vertex_colors[global_v]
                         color_layer.data[loop_idx].color = (c.x, c.y, c.z, c.w)
 
+            # validate() after material/UV/color setup (removes degenerate
+            # geometry) and BEFORE custom normals (needs a clean mesh).
+            mdb.validate(clean_customdata=False)  # logging done above via pre-scan
             # Custom split normals (GitHub #1/#7), remapped to local verts.
             if shape.normals is not None:
                 _apply_custom_split_normals(
