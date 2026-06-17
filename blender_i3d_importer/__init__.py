@@ -495,6 +495,13 @@ class FS25_OT_prepare_for_community_exporter(Operator):
     nothing is selected). Run it after switching slots to the Export
     materials (the debug materials carry no re-export properties).
 
+    Also bridges shape-level flags: the importer stores the i3d shape
+    attributes as i3D_<name> object properties (for the official exporter);
+    the community exporter reads them from the mesh-data i3d_attributes
+    PropertyGroup. Mirrors nonRenderable (collisions/triggers), castsShadows,
+    receiveShadows, renderedInViewports, terrainDecal, doubleSided and cpuMesh
+    so GE shape settings re-export correctly.
+
     Safe to re-run; it overwrites only the bridged fields.
     """
     bl_idname = "fs25.prepare_for_community_exporter"
@@ -633,18 +640,76 @@ class FS25_OT_prepare_for_community_exporter(Operator):
                 + (f" var='{variation}'" if variation else "")
                 + f", {applied_params} param(s), {applied_tex} texture(s)")
 
+    @staticmethod
+    def _gather_mesh_objects(context):
+        """Mesh objects to bridge shape attributes for. ALWAYS scene-wide over
+        imported i3d meshes (those carrying an i3D_* shape prop), NOT
+        selection-scoped: nonRenderable shapes (collisions, triggers) are
+        hidden by the importer and therefore can't be selected, so a
+        selection-only gather would silently miss exactly the shapes this is
+        meant to flag."""
+        return [o for o in bpy.data.objects
+                if o.type == 'MESH' and o.data is not None
+                and any(k.startswith('i3D_') for k in o.keys())]
+
+    # Importer object prop (i3D_*, all bools) -> community mesh-data
+    # i3d_attributes BoolProperty. cpuMesh is handled separately because the
+    # community side is an EnumProperty ('0'/'256' -> meshUsage), not a bool.
+    _SHAPE_FLAG_MAP = (
+        ('i3D_nonRenderable',       'non_renderable'),
+        ('i3D_castsShadows',        'casts_shadows'),
+        ('i3D_receiveShadows',      'receive_shadows'),
+        ('i3D_renderedInViewports', 'rendered_in_viewports'),
+        ('i3D_terrainDecal',        'terrain_decal'),
+        ('i3D_doubleSided',         'double_sided'),
+    )
+
+    @classmethod
+    def _bridge_shape(cls, obj):
+        """Mirror the importer's i3D_<flag> object props into the community
+        exporter's mesh-data i3d_attributes shape flags, so GE shape settings
+        round-trip: nonRenderable (collisions/triggers), castsShadows,
+        receiveShadows, renderedInViewports, terrainDecal, doubleSided and
+        cpuMesh (-> meshUsage).
+
+        Only flags the i3d actually recorded (present on the object) are
+        written; omitted attributes keep the community exporter's own
+        (engine-matching) defaults instead of being force-reset. Unlike the
+        material path, the community exporter reads shape attributes from the
+        ORIGINAL mesh datablock (node_classes/node.py:
+        blender_object.data.i3d_attributes), so no depsgraph update_tag() is
+        needed. Returns (n_flags_applied, is_non_renderable)."""
+        data = obj.data
+        if data is None or not hasattr(data, 'i3d_attributes'):
+            return (0, False)
+        attrs = data.i3d_attributes
+        applied = 0
+        for okey, aname in cls._SHAPE_FLAG_MAP:
+            if okey in obj.keys():
+                setattr(attrs, aname, bool(obj[okey]))
+                applied += 1
+        # cpuMesh: bool on the importer side, enum ('0' off / '256' on ->
+        # meshUsage) on the community side.
+        if 'i3D_cpuMesh' in obj.keys():
+            attrs.cpu_mesh = '256' if bool(obj['i3D_cpuMesh']) else '0'
+            applied += 1
+        return (applied, bool(attrs.non_renderable))
+
     def execute(self, context):
         mats = self._gather_materials(context)
-        if not mats:
-            self.report({'WARNING'}, "No i3d materials found "
+        mesh_objs = self._gather_mesh_objects(context)
+        if not mats and not mesh_objs:
+            self.report({'WARNING'}, "No i3d materials or shapes found "
                                      "(select imported meshes, or import first)")
             return {'CANCELLED'}
 
-        # Community addon registers i3d_attributes on bpy.types.Material.
-        if not hasattr(mats[0], 'i3d_attributes'):
+        # Community addon registers i3d_attributes on bpy.types.Material AND
+        # bpy.types.Mesh. Probe whichever datablock we actually have.
+        probe = mats[0] if mats else mesh_objs[0].data
+        if not hasattr(probe, 'i3d_attributes'):
             self.report({'ERROR'},
                         "Community 'GIANTS I3D Community Exporter' addon not "
-                        "installed/enabled — material.i3d_attributes missing")
+                        "installed/enabled — i3d_attributes missing")
             return {'CANCELLED'}
 
         n_ok = n_noshader = n_skip = 0
@@ -671,10 +736,27 @@ class FS25_OT_prepare_for_community_exporter(Operator):
             else:
                 n_skip += 1
 
+        # Shape-level flags (nonRenderable, shadows, terrainDecal, ...).
+        # Independent of materials, so a collision-only selection (meshes with
+        # no material) still bridges.
+        n_nonrender = 0
+        n_shape_flags = 0
+        for obj in mesh_objs:
+            try:
+                applied, is_nr = self._bridge_shape(obj)
+            except Exception as e:  # never let one shape abort the batch
+                self.report({'WARNING'}, f"'{obj.name}': {e}")
+                continue
+            n_shape_flags += applied
+            if is_nr:
+                n_nonrender += 1
+
         self.report({'INFO'},
                     f"Community export prep: {n_ok} bridged, "
                     f"{n_noshader} shader-not-found, {n_skip} skipped "
-                    f"(of {len(mats)} material(s))")
+                    f"(of {len(mats)} material(s)); "
+                    f"{n_shape_flags} shape flag(s) on {len(mesh_objs)} mesh(es), "
+                    f"{n_nonrender} nonRenderable")
         return {'FINISHED'}
 
 
