@@ -1673,6 +1673,29 @@ def build_pbr_debug_material(
     detail_spec_tex = cm_tex.get('detailSpecular')
     detail_norm_tex = cm_tex.get('detailNormal')
 
+    # Seed a base color for albedo-less vehicleShader materials. Some materials
+    # omit <Texture> (baseMap) entirely - e.g. the "Default OBJ" placeholder
+    # material on the John Deere 5M left mirror part - leaving base_color_source
+    # None. In-game the vehicleShader still multiplies detailDiffuse (tri-planar)
+    # over the material's diffuseColor, so the part carries the detail pattern,
+    # not a flat color. Because the detailDiffuse / colorScale / AO compositing
+    # below is all gated on base_color_source, a missing baseMap would otherwise
+    # skip that chain and render the part as flat diffuseColor (often ~white).
+    # Seed a constant-color source from diffuseColor (default white) so the
+    # detail chain applies, matching in-game appearance.
+    if (base_color_source is None
+            and detail_diff_tex is not None
+            and _tp_shader_name == 'vehicleshader.xml'):
+        seed_rgba = _parse_vec4(mat_attrs.get('diffuseColor'),
+                                default=(1.0, 1.0, 1.0, 1.0))
+        seed_rgb = nt.nodes.new('ShaderNodeRGB')
+        seed_rgb.location = (500, -1100)
+        seed_rgb.label = "diffuseColor (no baseMap)"
+        seed_rgb.outputs['Color'].default_value = (
+            seed_rgba[0], seed_rgba[1], seed_rgba[2], 1.0)
+        base_color_source = seed_rgb.outputs['Color']
+        composited_features.append('SeededBaseColor')
+
     if detail_diff_tex is not None and base_color_source is not None:
         vd_mix = nt.nodes.new('ShaderNodeMix')
         vd_mix.data_type = 'RGBA'
