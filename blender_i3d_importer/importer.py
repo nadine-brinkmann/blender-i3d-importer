@@ -570,7 +570,7 @@ def _build_node(node, parent, collection, scene, mesh_cache, material_cache,
         next_parent = parent
     else:
         collection.objects.link(obj)
-        _apply_transform(obj, node)
+        _apply_transform(obj, node, parent)
         _set_meta_props(obj, node, scene, report)
         if parent is not None:
             obj.parent = parent
@@ -1539,8 +1539,14 @@ def _create_light_object(node, report):
                    f"Light '{node.name}' invalid range='{range_str}'")
 
     shadow_str = raw.get('castShadowMap')
-    if shadow_str is not None:
-        light_data.use_shadow = str(shadow_str).strip().lower() in ('true', '1', 'yes')
+    # FS i3d omits castShadowMap for non-shadow lights. Blender's default
+    # use_shadow is True, so set False explicitly when absent - otherwise the
+    # Giants exporter emits castShadowMap="true" for every light and the
+    # Giants Editor shows them as shadow-casting (pink cone) instead of yellow.
+    light_data.use_shadow = (
+        str(shadow_str).strip().lower() in ('true', '1', 'yes')
+        if shadow_str is not None else False
+    )
 
     if blender_type == 'SPOT':
         cone_str = raw.get('coneAngle')
@@ -1617,7 +1623,7 @@ def _create_camera_object(node, report):
     return bpy.data.objects.new(name=node.name, object_data=camera_data)
 
 
-def _apply_transform(obj, node):
+def _apply_transform(obj, node, parent=None):
     """Translation 1:1, rotation Y-up -> Z-up converted, scale 1:1.
 
     XML rotation values come from the FS25 (Y-up) coordinate system. The
@@ -1635,6 +1641,15 @@ def _apply_transform(obj, node):
     post-mult that compensates Blender's local-Z-forward light convention
     against FS25's Y-up local-Z-forward convention. The importer mirrors that
     with an extra @ R_x(+90) post-mult so the round-trip is symmetric.
+
+    Nested Light/Camera (parent is ALSO Light/Camera): the exporter applies a
+    SECOND correction (dccBlender.py:1287-1288) - a parent pre-mult R_x(+90).
+    Together with the self post-mult R_x(-90) and the bake() they cancel, so
+    the exporter passes this node's matrix_local through UNCHANGED. We must
+    therefore store the RAW Y-up XML rotation here (no M-conjugation, no self
+    +90); otherwise the child light re-exports +90 deg off about X and its
+    spot cone points the wrong way (#31 - scattered lightsources on nested
+    lights). Translation stays raw (already correct) for the same reason.
     """
     import mathutils
     obj.location = node.translation
@@ -1649,8 +1664,12 @@ def _apply_transform(obj, node):
     R_blender = M @ R_xml @ M.inverted()
 
     if obj.type in ('LIGHT', 'CAMERA'):
-        R_x_plus90 = mathutils.Matrix.Rotation(math.radians(90), 4, 'X')
-        R_blender = R_blender @ R_x_plus90
+        if parent is not None and parent.type in ('LIGHT', 'CAMERA'):
+            # Exporter passes nested-light matrix_local through unchanged.
+            R_blender = R_xml
+        else:
+            R_x_plus90 = mathutils.Matrix.Rotation(math.radians(90), 4, 'X')
+            R_blender = R_blender @ R_x_plus90
 
     obj.rotation_euler = R_blender.to_euler('XYZ')
     obj.scale = node.scale
