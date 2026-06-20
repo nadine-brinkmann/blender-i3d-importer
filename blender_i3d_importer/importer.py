@@ -366,6 +366,11 @@ def import_i3d(i3d_filepath: str, report: Callable = None,
         # and deforms the skinned mesh at rest - #6).
         _finalize_skin_childof(import_collection, _report)
 
+        # Re-parent chained skin joints (bind joint under bind joint) via real
+        # bone parenting now that axis correction has finalized the bone rests
+        # (Giants exporter chain support; see _process_skin_weights stash).
+        _finalize_skin_chains(import_collection, _report)
+
         # apply hide AFTER axis correction. hide_set matches the H
         # shortcut (view-layer eye). On Giants re-export this leads to
         # visibility="false" in the XML because the exporter reads
@@ -2499,6 +2504,98 @@ def _compute_xml_world_translation(obj):
     return pos
 
 
+def _finalize_skin_chains(import_collection, report):
+    """Re-create joint CHAINS (a bind joint parented to another bind joint, e.g.
+    HW180V9) via real bone parenting, AFTER axis correction has finalized the
+    bone rests. The Giants exporter only honours bone parenting for chains
+    (boneHasParentBone, i3d_export.py:1523) and computes the child relative to
+    the parent bone, so the correct rest depends on the post-axis parent bone
+    matrix. _process_skin_weights stashed the per-chain plan (child bone, parent
+    bone, matrix_exp) on the armature as '_i3d_chainfix'. We set:
+
+        child.matrix = parent_bone.matrix @ Rx(90) @ matrix_exp @ Rx(-90)
+
+    Because bakeTransformMatrix distributes over products and Rx(90)/Rx(-90)
+    cancel inside it, the exporter then emits exactly matrix_exp's translation
+    and rotation - the joint's original local transform. Processing parents
+    before children telescopes multi-level chains (the parent's own correction
+    cancels). Verified by HW180V9 round-trip."""
+    import bpy as _bpy
+    import json as _json
+    from mathutils import Matrix as _Mat
+    _Rx90 = _Mat.Rotation(math.radians(90), 4, 'X')
+    _Rxm90 = _Mat.Rotation(math.radians(-90), 4, 'X')
+
+    for arm_obj in [o for o in import_collection.objects if o.type == 'ARMATURE']:
+        raw = arm_obj.get('_i3d_chainfix')
+        if not raw:
+            continue
+        try:
+            plan = _json.loads(raw)
+        except Exception:
+            del arm_obj['_i3d_chainfix']
+            continue
+        # child bone name -> (parent bone name, matrix_exp)
+        entry = {cbn: (pbn, _Mat([m[0:4], m[4:8], m[8:12], m[12:16]]))
+                 for cbn, pbn, m in plan}
+        # parent-before-child order
+        ordered, placed, rem = [], set(), list(entry)
+        while rem:
+            progress = False
+            for cbn in list(rem):
+                pbn = entry[cbn][0]
+                if pbn not in entry or pbn in placed:
+                    ordered.append(cbn); placed.add(cbn); rem.remove(cbn)
+                    progress = True
+            if not progress:
+                ordered.extend(rem)  # cycle guard - should not happen
+                break
+        prev_active = _bpy.context.view_layer.objects.active
+        _bpy.context.view_layer.objects.active = arm_obj
+        _bpy.ops.object.mode_set(mode='EDIT')
+        try:
+            ad = arm_obj.data
+            for cbn in ordered:
+                pbn, mexp = entry[cbn]
+                if cbn == pbn:
+                    continue
+                ceb = ad.edit_bones.get(cbn)
+                peb = ad.edit_bones.get(pbn)
+                if ceb is None or peb is None:
+                    continue
+                newm = peb.matrix @ _Rx90 @ mexp @ _Rxm90
+                # A NaN/inf in an edit-bone matrix crashes Blender natively, so
+                # validate before assigning - a joint with a degenerate or
+                # zero-scale transform can produce one.
+                if not all(math.isfinite(c) for r in newm for c in r):
+                    report('WARNING',
+                           f"chained skin joint {cbn!r}: non-finite bone matrix "
+                           f"- left unparented")
+                    continue
+                # Refuse cyclic parenting (would also crash Blender).
+                _anc, _cyclic = peb, False
+                while _anc is not None:
+                    if _anc == ceb:
+                        _cyclic = True
+                        break
+                    _anc = _anc.parent
+                if _cyclic:
+                    continue
+                ceb.use_connect = False
+                ceb.parent = peb
+                ceb.matrix = newm
+        finally:
+            _bpy.ops.object.mode_set(mode='OBJECT')
+        if prev_active is not None:
+            try:
+                _bpy.context.view_layer.objects.active = prev_active
+            except Exception:
+                pass
+        del arm_obj['_i3d_chainfix']
+        report('INFO',
+               f"{arm_obj.name}: re-parented {len(ordered)} chained skin joint(s)")
+
+
 def _finalize_skin_childof(import_collection, report):
     """Set the proper Child-Of inverse on skin-wrapper bones and unmute them,
     AFTER _apply_axis_correction has baked X+90 into the armature's bone rest
@@ -2572,7 +2669,7 @@ def _process_skin_weights(import_collection, shape_map, shape_id_to_obj, report)
     interaction) must be verified in a re-export / in-game test.
     """
     import bpy as _bpy
-    from mathutils import Vector as _Vec, Matrix as _Mat
+    from mathutils import Vector as _Vec, Matrix as _Mat, Euler as _Eul
 
     # Flush pending transforms so source_obj.matrix_world is up to date.
     _bpy.context.view_layer.update()
@@ -2638,6 +2735,19 @@ def _process_skin_weights(import_collection, shape_map, shape_id_to_obj, report)
                f"skin-weights: bind nodes not found: {missing} - "
                f"those slots get a placeholder bone at origin")
 
+    # Detect joint CHAINS: a bind joint whose original parent is itself a bind
+    # joint (HW180V9 has 22). These must be re-created via bone PARENTING, not a
+    # Child-Of to the parent joint Empty - the Giants exporter parents a bone to
+    # its parent bone when boneHasParentBone is true (i3d_export.py:1523), and it
+    # ignores the Child-Of bone subtarget, so a Child-Of-to-bone would be lost.
+    obj_to_nid = {info['src']: nid for nid, info in joint_info.items()
+                  if info and info['src'] is not None}
+    chained_parent_nid = {}   # child joint nid -> parent joint nid
+    for _nid, _info in joint_info.items():
+        _pnid = obj_to_nid.get(_info['parent'])
+        if _pnid is not None:
+            chained_parent_nid[_nid] = _pnid
+
     orig_active = _bpy.context.view_layer.objects.active
 
     # ---- Build ONE shared armature at the scene root ----
@@ -2694,6 +2804,53 @@ def _process_skin_weights(import_collection, shape_map, shape_id_to_obj, report)
                 bone.head = head_local
                 bone.tail = bone.head + y_axis * 0.1
                 bone.align_roll(z_axis)
+
+        # Joint chains (a bind joint parented to another bind joint, e.g.
+        # HW180V9 has 22): the Giants exporter re-creates a chain only via real
+        # bone PARENTING (boneHasParentBone, i3d_export.py:1523), and it then
+        # computes the child RELATIVE TO THE PARENT BONE. The correct bone rest
+        # therefore depends on the parent bone matrix AFTER the X+90 axis
+        # correction that runs later, so we cannot set it here. Instead stash
+        # each chained joint's invariant local transform (relative to its parent
+        # joint) NOW, while the joint Empties still exist, and apply the
+        # parenting + reverse-engineered rest in _finalize_skin_chains() after
+        # axis correction. matrix_exp = src.matrix_local @ Rx(90) is the matrix
+        # the exporter must end up computing for this node (the post-pass sets
+        # child.matrix = parent_bone.matrix @ Rx(90) @ matrix_exp @ Rx(-90),
+        # which makes the exporter emit the original local translation/rotation;
+        # verified by round-trip on HW180V9).
+        _chainfix = []
+        for _nid, _pnid in chained_parent_nid.items():
+            _cbn = bone_name_of.get(_nid)
+            _pbn = bone_name_of.get(_pnid)
+            _info = joint_info.get(_nid)
+            _src = _info['src'] if _info else None
+            if not _cbn or not _pbn or _src is None:
+                continue
+            # matrix_exp must be the matrix the exporter ends up decomposing.
+            # The exporter does to_euler('XYZ') then subtracts 90 from the X
+            # euler, so we need to_euler(matrix_exp) == (rxml.x + 90, y, z).
+            # A plain `matrix_local @ Rx(90)` is WRONG at gimbal lock (|Y|==90):
+            # Blender 'XYZ' euler is Rz@Ry@Rx, so a left/right Rx(90) does not
+            # simply add 90 to the X euler there. Build it from the euler so it
+            # is exact even at |Y|==90 (verified on HW180V9's +/-90deg joints).
+            # Recover the raw Y-up XML rotation: the joint TG was imported with
+            # rot = M @ R_xml @ M^-1 (M = Rx(90)); undo the conjugation.
+            _M3 = _Mat.Rotation(math.radians(90), 3, 'X')
+            _rxml = (_M3.inverted() @ _src.matrix_local.to_3x3() @ _M3).to_euler('XYZ')
+            _mexp = (_Mat.Translation(_src.matrix_local.to_translation())
+                     @ _Eul((_rxml.x + math.radians(90), _rxml.y, _rxml.z),
+                            'XYZ').to_matrix().to_4x4())
+            if not all(math.isfinite(_c) for _row in _mexp for _c in _row):
+                # Degenerate joint transform -> would crash on bone.matrix set.
+                report('WARNING',
+                       f"skin joint {_cbn!r}: degenerate local transform - "
+                       f"chain re-parenting skipped")
+                continue
+            _chainfix.append([_cbn, _pbn, [c for _row in _mexp for c in _row]])
+        if _chainfix:
+            import json as _json
+            arm_obj['_i3d_chainfix'] = _json.dumps(_chainfix)
     finally:
         _bpy.ops.object.mode_set(mode='OBJECT')
 
@@ -2708,6 +2865,8 @@ def _process_skin_weights(import_collection, shape_map, shape_id_to_obj, report)
         info = joint_info.get(nid)
         if not info or info['parent'] is None:
             continue
+        if nid in chained_parent_nid:
+            continue  # parented via bone hierarchy (chain), not Child-Of
         pb = arm_obj.pose.bones.get(bone_name_of[nid])
         if pb is None:
             continue
