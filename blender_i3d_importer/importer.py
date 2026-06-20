@@ -2920,13 +2920,21 @@ def _process_merge_groups(import_collection, shape_map, shape_id_to_obj, report)
 
         mg_counter += 1
         if mg_counter > 9:
-            report('ERROR',
-                   f"{root_obj.name}: more than 9 MergeGroups in this scene — "
-                   f"Giants exporter limits to 9. Re-export will lose excess groups.")
-            # Keep going so the user at least sees the geometry; the property won't
-            # be valid for re-export but the rest of the import succeeds.
+            # The Giants export PANEL caps the i3D_mergeGroup field at 9, but
+            # that is only a UI authoring limit: the exporter reads the raw
+            # custom property (I3DGetAttr -> obj[attr], no clamp) and the i3d
+            # format stores no merge-group number at all (just a Shape with
+            # skinBindNodeIds). Verified empirically: i3D_mergeGroup=10 exports
+            # to a valid .i3d/.i3d.shapes and loads fine in Giants Editor
+            # 10.0.12. So we keep the real group number and round-trip intact;
+            # the only caveat is the field can't be edited in the Giants panel.
+            report('WARNING',
+                   f"{root_obj.name}: MergeGroup #{mg_counter} is beyond the "
+                   f"Giants export panel's editable range (1-9). It re-exports "
+                   f"and loads in GE fine, but its Merge Group field can't be "
+                   f"edited in the Giants export panel.")
 
-        mg_num = min(mg_counter, 9)
+        mg_num = mg_counter
 
         # -------- Compute per-slot vertex / triangle index lists --------
         num_slots = len(bind_ids)
