@@ -2786,19 +2786,48 @@ def _process_skin_weights(import_collection, shape_map, shape_id_to_obj, report)
                f"({len(vg_map)} bone(s), {weight_count} weight(s))")
 
     # ---- Remove the now-duplicate source joint Empties ----
+    # Joint Empties can be parented to OTHER bind joints (joint chains, e.g.
+    # HW180V9 has 22 of them). We must NOT reparent a child onto a captured
+    # joint.parent that is itself a joint scheduled for removal: if that parent
+    # joint is removed first, the reference goes stale and `child.parent =
+    # <removed>` raises "StructRNA of type Object has been removed", aborting
+    # the whole import before axis correction runs (#29 - the mesh then stays
+    # Y-up / 90 deg off). So resolve every reparent target to the nearest
+    # ancestor that is NOT a joint being removed, and snapshot the full plan
+    # BEFORE deleting anything.
+    joint_objs = {info['src'] for info in joint_info.values()
+                  if info and info['src'] is not None}
+
+    def _surviving_ancestor(obj):
+        p = obj.parent
+        while p is not None and p in joint_objs:
+            p = p.parent
+        return p
+
+    # (child, target_parent, world_matrix). Only non-joint children need
+    # reparenting; child joints are removed in this same pass. Targets are
+    # non-joint survivors, so they never go stale during the removals below.
+    reparent_plan = []
+    for info in joint_info.values():
+        src = info['src'] if info else None
+        if src is None:
+            continue
+        target = _surviving_ancestor(src)
+        for child in src.children:
+            if child in joint_objs:
+                continue
+            reparent_plan.append((child, target, child.matrix_world.copy()))
+
+    for child, target, mw in reparent_plan:
+        child.parent = target
+        child.matrix_world = mw
+
     removed = 0
     for nid in unique_joint_ids:
         info = joint_info.get(nid)
         if not info or info['src'] is None:
             continue
         src = info['src']
-        parent = info['parent']
-        # Re-parent any children up to the joint's parent, keeping world
-        # transform (precea joints are leaves; this is defensive).
-        for child in list(src.children):
-            mw = child.matrix_world.copy()
-            child.parent = parent
-            child.matrix_world = mw
         try:
             _bpy.data.objects.remove(src, do_unlink=True)
             removed += 1
