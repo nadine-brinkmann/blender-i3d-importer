@@ -5,8 +5,6 @@ This guide walks you through getting it running on Blender 5.1 so you can **re-e
 
 > Why you might want this: the FS22 exporter writes FS22-style `.i3d` files (single `collisionMask`, FS22 collision groups, etc.). If you mod for Farming Simulator 22, this is the toolchain you need. For FS25, use the official 10.0.2 exporter instead - it already runs on Blender 5.1. without tweaking.
 
-These three fixes only make the exporter **run and export**. Round-trip fidelity of render attributes (castsShadows, clipDistance, nonRenderable, ...) is handled on the **importer** side, which mirrors its custom properties to the uppercase `I3D_*` names the FS22 exporter expects. Use a current importer build.
-
 We make the three small edits **first** and only then install the add-on. That way you end up with a ready-patched `.zip` you can keep and reinstall any time (for example in a fresh Blender install) without redoing the edits.
 
 ---
@@ -14,27 +12,31 @@ We make the three small edits **first** and only then install the add-on. That w
 ## Step 1 - Download the exporter (9.1.0)
 
 1. Go to the **GIANTS Developer Network**: https://gdn.giants-software.com
-2. Sign in, go to the **Downloads** section, find **Blender Exporter Plugins**,
-   and download version **9.1.0** (Windows installer `.exe`).
+2. Go to the **Downloads** section, find **Blender Exporter Plugins**, and download version **9.1.0** (Windows installer `.exe`).
 
 ## Step 2 - Unpack the downloaded installer
 
 1. Double click the downloaded installer exe. A menu will pop up where you can select the Blender version you want to install it on. No Blender version later that 3.6.9 is listed. Therefore:
 2. On the same page, click `Extract Files...` instead (bottom left).
+
 ![Screenshot: the installer with the "Extract Files..." button](screenshots/01-extract-files.png)
-3. A folder selection comes up. Select a folder where you want to extract the files to (2 files will be extracted, a zip and a text file).
-4. After extraction, you get a success message.
+
+4. A folder selection comes up. Select a folder where you want to extract the files to (2 files will be extracted, a zip and a text file) and confirm.
+5. After extraction, you get a success message.
+
 ![Screenshot: Extract Files success message](screenshots/01a-extract-files-success.png)
+
 
 ## Step 3 - Unzip the add-on so you can edit it
 
-The add-on itself sits inside the `.zip` from Step 2. Unzip it so you can open the files.
+The add-on itself sits inside the `io_export_i3d.zip` from Step 2. Unzip it so you can open the files.
 
-1. Right-click the `.zip` from Step 2 and choose **Extract All...** (or use your unzip tool).
+1. Right-click the `io_export_i3d.zip` from Step 2 and choose **Extract All...** (or use your unzip tool).
 2. You now have a folder named **`io_export_i3d`** containing the add-on's files. This is the folder you will edit in Step 4.
+
 ![Screenshot: the unzipped io_export_i3d folder](screenshots/02-unzipped-folder.png)
 
-## Step 4 - Apply the three fixes
+## Step 4 - Apply the three fixes manually
 
 You will edit three text files inside the `io_export_i3d` folder. Open each file in a plain text editor (standard Notepad works just fine; **Notepad++** or **VS Code** are a bit nicer but optional).
 
@@ -144,9 +146,9 @@ def getSelectedObjects(context):
 
 
 
+## Step 4 - Apply the three fixes with a patch tool (Advanced alternative (optional!))
+***If you already did the manual fixes above, skip this step! You are done with the fixes. Proceed to Step 5!***
 
-> **Advanced (optional):** 
-***If you already did the manual fixes above, skip this step! You are done with the fixes. Proceed to Step 5.***
 Instead of editing by hand you can apply the supplied `.patch` files with the `patch` tool (Git Bash / Linux / WSL):
 > ```bash
 > cd io_export_i3d
@@ -158,19 +160,17 @@ Instead of editing by hand you can apply the supplied `.patch` files with the `p
 
 ## Step 5 - Zip it back up and install it in Blender 5.1
 
-1. Zip the **`io_export_i3d` folder** back up (right-click the folder -> *Send to*
-   -> *Compressed (zipped) folder*, or use your zip tool). 
-2. Make sure the `io_export_i3d` folder sits at the **top level** of the new `.zip` file. 
-3. Also make sure that you have **exactly one** folder named `io_export_i3d` inside the zip file, and not another folder `io_export_i3d` below it. (If you are unsure, compare the structure of your zip file to the original zip file before you applied the fixed it. It should be the same.)
-4. **Keep this `.zip`** file somewhere safe - this is your reusable, ready-patched exporter!
+1. Go into the **`io_export_i3d` folder** so that you see the __init__.py file. Then go up **exactly one level** in the folder structure, so that you see the **`io_export_i3d` folder**.
+2. Zip this **`io_export_i3d` folder** back up by right-clicking it -> *Send to* -> *Compressed (zipped) folder* (or use your own zip tool). 
+3. Make sure the `io_export_i3d` folder sits at the **top level** of the new `.zip` file. Also make sure that you have **exactly one** folder named `io_export_i3d` inside the zip file, and not another folder `io_export_i3d` below it. (If you are unsure, compare the structure of your zip file to the original zip file before you applied the fixes. It must be the same.)
+5. **Keep this `.zip`** file somewhere safe - this is your reusable, ready-patched exporter!
 
    ![Screenshot: zipping the patched io_export_i3d folder](screenshots/04-zip-folder.png)
 
 2. Start **Blender 5.1**.
 3. There are two alternative ways of installing the add-on:
-  a. Drag and drop the zip file onto your Blender Window. Confirm the installation dialog.
-  b. Open `Edit` -> `Preferences` -> `Add-ons`. 
-     Then Click the **down-arrow (v)** in the top-right of the Add-ons panel and choose **Install from Disk...**. Select your zip file and confirm.
+   a. Drag and drop the zip file onto your Blender Window. Confirm the installation dialog. 
+   b. Open `Edit` -> `Preferences` -> `Add-ons`. Then Click the **down-arrow (v)** in the top-right of the Add-ons panel and choose **Install from Disk...**. Select your zip file and confirm.
 
    ![Screenshot: the Install from Disk menu](screenshots/05-install-from-disk.png)
 
