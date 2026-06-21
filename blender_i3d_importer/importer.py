@@ -1895,6 +1895,17 @@ def _build_material(material_id, scene, image_cache, shader_cache, i3d_dir, repo
             bsdf.inputs['Alpha'].default_value = rgba[3]
             mat.blend_method = 'BLEND'
 
+    # alphaBlending material attribute -> blend_method='BLEND'. The Giants
+    # exporter derives <Material alphaBlending="true"> SOLELY from
+    # mat.blend_method == 'BLEND' (io_export_i3d .../dcc/dccBlender.py:1740),
+    # so without this the flag is dropped on re-export and transparent
+    # surfaces (glass, light lenses) turn opaque/invisible in the Giants
+    # Editor. Independent of diffuse alpha: glass usually carries
+    # alphaBlending="true" with a fully opaque diffuse color, so the
+    # rgba[3] < 1.0 branch above never fires for it.
+    if str(mat_attrs.get('alphaBlending', '')).strip().lower() in ('true', '1', 'yes'):
+        mat.blend_method = 'BLEND'
+
     # UV-Map + Mapping node - lazily initialized only when at least one image
     # texture is actually created. This makes it visible in the shader editor
     # which UV map the textures use, and the user can change it if needed.

@@ -25,7 +25,7 @@ copyright = [
 platforms = ["windows-x64"]
 
 [permissions]
-files = "Read i3d files, textures, and shader XMLs from disk; write temporary OBJx files during import"
+files = "Read i3d, texture and shader files; write temp import files"
 
 [build]
 paths_exclude_pattern = [
