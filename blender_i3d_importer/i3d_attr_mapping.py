@@ -136,6 +136,12 @@ SCENE_ATTR_MAP: Dict[str, Tuple[str, Callable]] = {
     'collision':                    ('i3D_collision',                    _to_bool),
     'collisionFilterMask':          ('i3D_collisionFilterMask',          _hex_or_dec_to_decstr),
     'collisionFilterGroup':         ('i3D_collisionFilterGroup',         _hex_or_dec_to_decstr),
+    # collisionMask: FS22 single combined mask. FS25 split it into
+    # collisionFilterGroup + collisionFilterMask (verified: FS22 game i3d
+    # uses collisionMask, FS25 uses the split pair). Preserved so an FS22
+    # re-export (reads I3D_collisionMask via the i3D_->I3D_ mirror below)
+    # stays faithful. Cross-version FS22<->FS25 conversion is NOT attempted.
+    'collisionMask':                ('i3D_collisionMask',                _hex_or_dec_to_decstr),
     'static':                       ('i3D_static',                       _to_bool),
     'dynamic':                      ('i3D_dynamic',                      _to_bool),
     'kinematic':                    ('i3D_kinematic',                    _to_bool),
@@ -263,3 +269,33 @@ def apply_attrs_to_object(obj, raw_attrs: Dict[str, str], report: Callable) -> N
         else:
             # Unknown attribute: park it so nothing gets lost.
             obj[f'_i3d_raw_{xml_attr}'] = str(value)
+
+    # ---- FS22 re-export compat: mirror i3D_* -> I3D_* --------------------
+    # FS22 exporter (9.1.0) reads object props by the *uppercase* key
+    # (I3D_<name>, dcc/__init__.py SETTINGS_ATTRIBUTES); FS25 (10.0.x) reads
+    # lowercase (i3D_<name>). We always store FS25-style AND mirror to
+    # uppercase, so the same .blend re-exports faithfully on either exporter
+    # (each ignores the other's casing). objectMask/navMeshMask are TYPE_INT
+    # in FS22 but stored here as decimal strings -> convert; skip values that
+    # overflow signed int32 (e.g. sun-light masks), which Blender's int
+    # IDProperty cannot hold anyway.
+    _FS22_INT_FROM_STRING = ('i3D_objectMask', 'i3D_navMeshMask')
+    for key in list(obj.keys()):
+        if not key.startswith('i3D_'):
+            continue
+        upper = 'I3D_' + key[4:]
+        if upper in obj:
+            continue
+        val = obj[key]
+        if key in _FS22_INT_FROM_STRING and isinstance(val, str):
+            try:
+                iv = int(val, 0)
+            except (ValueError, TypeError):
+                continue
+            if -2147483648 <= iv <= 2147483647:
+                obj[upper] = iv
+            else:
+                report('INFO', f"{obj.name}: {key}={val} exceeds int32, "
+                               f"skipping FS22 mirror ({upper})")
+        else:
+            obj[upper] = val

@@ -434,12 +434,20 @@ def import_i3d(i3d_filepath: str, report: Callable = None,
         #   - i3D_exportFileLocation = EXPORT_DIR + basename of the imported i3d
         try:
             settings = bpy.context.scene.I3D_UIexportSettings
-            settings.i3D_gameLocationDisplay = FS25_DATA_BASE.rstrip("\\/") + "\\"
-            settings.i3D_exportUseSoftwareFileName = False
+            # FS25 10.0.x exporter registers lowercase i3D_* UI field names,
+            # FS22 9.1.0 uses uppercase I3D_* (same field stems, same scene
+            # group I3D_UIexportSettings). Pick whichever casing the installed
+            # exporter actually has, otherwise the first assignment raises
+            # AttributeError on FS22 and the whole setup is skipped silently.
+            pfx = 'i3D_' if hasattr(settings, 'i3D_gameLocationDisplay') else 'I3D_'
+            setattr(settings, pfx + 'gameLocationDisplay',
+                    FS25_DATA_BASE.rstrip("\\/") + "\\")
+            setattr(settings, pfx + 'exportUseSoftwareFileName', False)
             if EXPORT_DIR:
-                settings.i3D_exportFileLocation = str(Path(EXPORT_DIR) / i3d.name)
+                setattr(settings, pfx + 'exportFileLocation',
+                        str(Path(EXPORT_DIR) / i3d.name))
                 _report('INFO',
-                        f"Giants exporter configured: "
+                        f"Giants exporter configured ({pfx}): "
                         f"gameLocation={FS25_DATA_BASE}, exportFile={i3d.name}")
             else:
                 _report('INFO',
