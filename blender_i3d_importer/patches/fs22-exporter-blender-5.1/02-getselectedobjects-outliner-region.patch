@@ -1,0 +1,36 @@
+--- util/selectionUtil.py	(original, io_export_i3d 9.1.0)
++++ util/selectionUtil.py	(patched - Blender 5.1: selected_ids needs OUTLINER region)
+@@ -329,14 +329,22 @@
+ def getSelectedObjects(context):
+     # get active object from outliner context
+     # this also includes hidden objects like collision etc
+-    for area in context.screen.areas:
+-        if area.type == 'OUTLINER':
+-            override = context.copy()
+-            override['area'] = area
+-            with bpy.context.temp_override(area=area):
+-                if len(context.selected_ids) == 0:
+-                    if len(context.selected_objects) > 0:
+-                        return context.selected_objects
+-                else:
+-                    return context.selected_ids
+-    return []
++    # Blender 4.x/5.x: context.selected_ids is only available when the
++    # temp_override also carries the OUTLINER region (not just the area).
++    # Mirrors the fix in the official 10.0.2 exporter.
++    selected_items = []
++    for area in context.screen.areas:
++        if area.type == 'OUTLINER':
++            try:
++                context_override = {}
++                context_override['area'] = area
++                context_override['region'] = [region for region in area.regions if region.type == 'WINDOW'][0]
++
++                with bpy.context.temp_override(**context_override):
++                    selected_items.extend(context.selected_ids)
++            except Exception as e:
++                print(f"An exception occurred: {e}")
++    if not selected_items:
++        selected_items.extend(context.selected_objects)
++
++    return selected_items

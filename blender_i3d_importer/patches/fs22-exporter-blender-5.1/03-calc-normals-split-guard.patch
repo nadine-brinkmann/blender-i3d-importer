@@ -1,0 +1,22 @@
+--- dcc/dccBlender.py	(original, io_export_i3d 9.1.0)
++++ dcc/dccBlender.py	(patched - Blender 5.1: calc_normals_split removed in 4.1)
+@@ -544,7 +544,8 @@
+     # -------------------------------------------------------------
+     # --- calculate triangles and normals with applied modifiers
+     m_meshGen.calc_loop_triangles()
+-    m_meshGen.calc_normals_split()
++    if bpy.app.version < (4, 1):
++        m_meshGen.calc_normals_split()
+ 
+     # -------------------------------------------------------------
+     #--- root -> member transformation
+@@ -771,7 +772,8 @@
+     # -------------------------------------------------------------
+     # --- calculate triangles and normals with applied modifiers
+     m_meshGen.calc_loop_triangles()
+-    m_meshGen.calc_normals_split()
++    if bpy.app.version < (4, 1):
++        m_meshGen.calc_normals_split()
+ 
+     # -------------------------------------------------------------
+     if (len(m_materialsList) > 1):
