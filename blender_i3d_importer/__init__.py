@@ -424,9 +424,31 @@ class FS25_OT_switch_materials(Operator):
         default='toggle',
     )
 
+    scope: bpy.props.EnumProperty(
+        name="Scope",
+        items=[
+            ('selection',    "Selection",    "Only selected mesh objects"),
+            ('all_imported', "All imported", "All mesh objects carrying i3d "
+                                             "materials, regardless of selection "
+                                             "or visibility"),
+        ],
+        default='selection',
+    )
+
     @classmethod
     def poll(cls, context):
-        return any(o.type == 'MESH' for o in context.selected_objects)
+        # Active whenever the scene contains any i3d mesh material. The
+        # 'Export (all)' button works scene-wide (scope='all_imported') and
+        # must not depend on selection; the Debug/Toggle buttons keep their
+        # selection requirement via layout.enabled in the N-Panel draw().
+        for obj in context.scene.objects:
+            if obj.type != 'MESH' or not obj.data:
+                continue
+            for slot in obj.material_slots:
+                m = slot.material
+                if m and m.get('_i3d_material_kind') in ('debug', 'export'):
+                    return True
+        return False
 
     def execute(self, context):
         # Lookup: (material_id, import_uuid, kind) -> material.
@@ -444,11 +466,21 @@ class FS25_OT_switch_materials(Operator):
             if mid is not None and kind in ('debug', 'export'):
                 lookup[(int(mid), imp_uuid, kind)] = m
 
+        # Object source depends on scope. 'all_imported' covers every mesh
+        # carrying an i3d material, regardless of selection or visibility -
+        # this is what the N-Panel 'Export (all)' button uses so no debug
+        # material can ever leak into a re-export via hidden helper objects
+        # (collision parts, shadowFocusBox, fill-root, component roots).
+        # slot.material assignment works on hidden objects without unhiding.
+        if self.scope == 'all_imported':
+            objects = [o for o in bpy.data.objects if o.type == 'MESH' and o.data]
+        else:
+            objects = [o for o in context.selected_objects
+                       if o.type == 'MESH' and o.data]
+
         swapped = 0
         skipped = 0
-        for obj in context.selected_objects:
-            if obj.type != 'MESH' or not obj.data:
-                continue
+        for obj in objects:
             for slot in obj.material_slots:
                 cur = slot.material
                 if cur is None:
@@ -457,7 +489,8 @@ class FS25_OT_switch_materials(Operator):
                 cur_kind = cur.get('_i3d_material_kind')
                 cur_uuid = cur.get('_i3d_import_uuid')
                 if mid is None or cur_kind not in ('debug', 'export'):
-                    skipped += 1
+                    # Non-i3d material: skip silently (no 'skipped' noise,
+                    # relevant in all_imported scope across the whole scene).
                     continue
                 # Determine target kind
                 if self.target_kind == 'toggle':
@@ -637,17 +670,27 @@ class FS25_PT_i3d_importer_panel(bpy.types.Panel):
         # Material switch section
         box = layout.box()
         box.label(text="Material Switch", icon='MATERIAL')
-        box.label(text="Affects selected meshes:")
+        box.label(text="Debug/Toggle: selected meshes")
+        box.label(text="Export (all): every imported object")
 
-        row = box.row(align=True)
+        # Debug + Toggle stay selection-scoped: greyed out without a mesh
+        # selection (unchanged limitation).
+        has_sel = any(o.type == 'MESH' for o in context.selected_objects)
+        col_sel = box.column(align=True)
+        col_sel.enabled = has_sel
+        row = col_sel.row(align=True)
         op_dbg = row.operator("fs25.switch_materials", text="Debug")
         op_dbg.target_kind = 'debug'
-        op_exp = row.operator("fs25.switch_materials", text="Export")
-        op_exp.target_kind = 'export'
-
-        row = box.row()
+        op_dbg.scope = 'selection'
         op_tog = row.operator("fs25.switch_materials", text="Toggle", icon='ARROW_LEFTRIGHT')
         op_tog.target_kind = 'toggle'
+        op_tog.scope = 'selection'
+
+        # Export (all): scene-wide, active whenever an import exists
+        # (independent of selection).
+        op_exp = box.operator("fs25.switch_materials", text="Export (all)")
+        op_exp.target_kind = 'export'
+        op_exp.scope = 'all_imported'
 
         # Tree season - shown only when the file actually has a
         # tree-branch debug material (treeBranchShader SEASONAL).

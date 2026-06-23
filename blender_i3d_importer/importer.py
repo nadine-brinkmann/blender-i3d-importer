@@ -493,12 +493,12 @@ def _has_any_shape_nodes(node) -> bool:
 
 
 def _strip_sort_prefix(name):
-    """Remove a leading 4-digit sort-order prefix ('0010:') added by
+    """Remove a leading sort-order prefix ('0010:' or '0010.<nodeId>:') added by
     _apply_sort_order_prefix. Used when deriving bone names from object names:
     the Giants exporter writes bone names verbatim (getBoneData does NOT strip
     the ':' prefix, unlike object node names), so a prefixed bone name would
     leak into the .i3d. No-op when the prefix feature is off."""
-    return re.sub(r"^\d{4}:", "", name or "")
+    return re.sub(r"^\d{4}(?:\.\d+)?:", "", name or "")
 
 
 def _collect_skinweight_excluded_ids(nodes, excluded):
@@ -542,7 +542,15 @@ def _apply_sort_order_prefix(nodes, excluded=None):
     for i, node in enumerate(nodes):
         if node.nodeId not in excluded:
             clean = (node.name or "").replace(":", ".")
-            node.name = f"{(i + 1) * 10:04d}:{clean}"
+            # (i+1)*10 governs sibling order (alphabetical == numeric on the
+            # zero-padded leading digits). nodeId is appended as a globally
+            # unique disambiguator so identical names at the same sibling index
+            # under different parents do NOT collide as Blender object names
+            # (Blender would append '.001', which survives re-export because the
+            # exporter only strips up to the last ':'). nodeId never affects
+            # ordering: within one parent every sibling already has a distinct
+            # leading number, so the nodeId part is never compared. GitHub #34.
+            node.name = f"{(i + 1) * 10:04d}.{node.nodeId}:{clean}"
         if node.children:
             _apply_sort_order_prefix(node.children, excluded)
 
