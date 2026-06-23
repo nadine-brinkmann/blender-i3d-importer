@@ -2066,6 +2066,19 @@ def _apply_material_custom_properties(mat, mat_attrs, scene, report, mat_name):
     if csv:
         mat['customShaderVariation'] = str(csv)
 
+    # alphaBlending: the i3d material attribute maps to Blender's blend_method.
+    # The Giants exporter derives alphaBlending solely from
+    # mat.blend_method == 'BLEND' (dccBlender.py:1753-1754); it does NOT read an
+    # IDProperty. Without setting blend_method here the flag is lost on re-export
+    # (new materials default to 'HASHED'), which breaks transparent light-glass
+    # lenses etc. Verified Blender 5.1.2: blend_method still exists ('BLEND' opt).
+    ab = mat_attrs.get('alphaBlending')
+    if isinstance(ab, str) and ab.strip().lower() == 'true':
+        try:
+            mat.blend_method = 'BLEND'
+        except Exception:
+            pass
+
     # customParameter_<name> for each <CustomParameter name="..." value="..."/>
     for cp in mat_attrs.get('_customparameters', []):
         name = cp.get('name')
