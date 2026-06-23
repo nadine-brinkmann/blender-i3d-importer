@@ -769,11 +769,25 @@ def _build_mesh_datablock(shape, datablock_name, node, scene, material_cache,
                     color_layer.data[loop_idx].color = md.vertex_colors[v_idx]
                 loop_idx += 1
 
-    # Material slots: one slot per materialId from the XML node.
-    for mat_id in node.materialIds:
+    # Material slots: one slot per materialId from the XML node. Carry the
+    # per-subset material slot name (read from the .i3d.shapes binary) onto the
+    # Blender material as the 'materialSlotName' IDProperty. The Giants exporter
+    # reads exactly this property (dcc/dccBlender.getShapeMaterials) and writes
+    # it back into the re-exported shapes. Without it the slot name is lost on
+    # re-export, breaking vehicle design/color configs that reference a material
+    # by slot name (e.g. <material materialSlotName="main_chassis_color_mat"/>):
+    # the engine's MaterialUtil.getMaterialBySlotName can no longer find it.
+    # The name lives on the shared material datablock, so merge-child sub-meshes
+    # (which reuse these materials) inherit it automatically.
+    _slot_names = getattr(shape, 'material_slot_names', None) or []
+    for _slot_idx, mat_id in enumerate(node.materialIds):
         mat = _get_or_create_material(
             mat_id, scene, material_cache, image_cache, shader_cache, i3d_dir, report
         )
+        if _slot_idx < len(_slot_names):
+            _sname = _slot_names[_slot_idx]
+            if _sname:
+                mat['materialSlotName'] = _sname
         mesh.materials.append(mat)
 
     # Set polygon.material_index per face.
