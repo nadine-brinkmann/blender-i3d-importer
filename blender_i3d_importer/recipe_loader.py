@@ -2158,6 +2158,25 @@ def build_pbr_debug_material(
                 bsdf.inputs['Emission Strength'].default_value = 1.0
             composited_features.append('staticLight (Emission)')
 
+    # Constant bakedAO (specularColor.y) when no AO texture drives it: feed it
+    # as ao_source so the fs25_AO_overlay below darkens the BaseColor. FS25
+    # uses specularColor.y as bakedAO (baseShader.ogsfx getSpecular). Skipped
+    # when an AO texture already set ao_source, or when AO is ~1.0 (neutral).
+    if ao_source is None:
+        _spec_ao = mat_attrs.get('specularColor')
+        if _spec_ao:
+            try:
+                _sc_ao = [float(x) for x in str(_spec_ao).split()]
+            except ValueError:
+                _sc_ao = []
+            if len(_sc_ao) >= 3 and _sc_ao[1] < 1.0:
+                _ao_val = nt.nodes.new('ShaderNodeValue')
+                _ao_val.name = 'fs25_const_ao'
+                _ao_val.label = 'bakedAO (specularColor.y)'
+                _ao_val.outputs[0].default_value = max(0.0, min(1.0, _sc_ao[1]))
+                _ao_val.location = (bsdf.location.x - 1400, bsdf.location.y - 700)
+                ao_source = _ao_val.outputs[0]
+
     # ---- 8. AO-Overlay (modifies BaseColor only) ----
     if base_color_source is not None and ao_source is not None:
         ao_ng = append_node_group(SN_AO_OVERLAY, snippets_blend_path, snippet_cache, report)
@@ -2468,6 +2487,27 @@ def build_pbr_debug_material(
         nt.links.new(metallic_source, bsdf.inputs['Metallic'])
     if normal_source is not None:
         nt.links.new(normal_source, bsdf.inputs['Normal'])
+
+    # specularColor constant -> debug BSDF for the FS look. FS25 reads
+    # specularColor as (smoothness, bakedAO, metalness) - baseShader.ogsfx
+    # getSpecular(). Map smoothness/metalness onto the BSDF, but ONLY when not
+    # already texture/snippet-driven (a linked Roughness/Metallic is the
+    # spatially-correct value and must win). The middle component is bakedAO,
+    # NOT specular intensity - it must NOT go on "Specular IOR Level" (would
+    # distort Fresnel). Leaving Specular IOR Level at Blender's default 0.5
+    # matches FS' fixed dielectric F0 0.04 (baseShader.ogsfx:662). Constant
+    # bakedAO is handled by the AO block above (fs25_const_ao).
+    spec = mat_attrs.get('specularColor')
+    if spec:
+        try:
+            sc = [float(x) for x in str(spec).split()]
+        except ValueError:
+            sc = []
+        if len(sc) >= 3:
+            if not bsdf.inputs['Roughness'].is_linked:
+                bsdf.inputs['Roughness'].default_value = max(0.0, min(1.0, 1.0 - sc[0]))
+            if 'Metallic' in bsdf.inputs and not bsdf.inputs['Metallic'].is_linked:
+                bsdf.inputs['Metallic'].default_value = sc[2]
 
     # ---- 11. Debug Switch ----
     # Wrap the BSDF -> Material Output link through a switch group that

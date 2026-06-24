@@ -1930,6 +1930,33 @@ def _build_material(material_id, scene, image_cache, shader_cache, i3d_dir, repo
             bsdf.inputs['Alpha'].default_value = rgba[3]
             mat.blend_method = 'BLEND'
 
+    # specularColor roundtrip. FS25 reads <Material specularColor> as
+    # (smoothness, bakedAO, metalness) - baseShader.ogsfx getSpecular(). The
+    # Giants Blender exporter writes it back as (1 - Roughness,
+    # "Specular IOR Level", Metallic) - dccBlender.py - i.e. it overloads the
+    # BSDF "Specular IOR Level" input as the carrier for the bakedAO value. We
+    # never set these on import, so the exporter regenerated specularColor from
+    # BSDF defaults -> wrong/added specularColor on nearly every material
+    # (QA harness 2026-06-24). Set them here so the re-export is exact. This is
+    # the re-export ("data") material; its own viewport look is secondary (the
+    # PBR debug material carries the FS look). The exporter reads default_value
+    # even when Roughness is glossmap-linked (its is_linked check is disabled),
+    # so the roundtrip stays correct.
+    spec = mat_attrs.get('specularColor')
+    if spec:
+        try:
+            sc = [float(x) for x in str(spec).split()]
+        except ValueError:
+            sc = []
+        if len(sc) >= 3:
+            bsdf.inputs['Roughness'].default_value = max(0.0, min(1.0, 1.0 - sc[0]))
+            if 'Metallic' in bsdf.inputs:
+                bsdf.inputs['Metallic'].default_value = sc[2]
+            spec_name = ('Specular IOR Level' if 'Specular IOR Level' in bsdf.inputs
+                         else 'Specular' if 'Specular' in bsdf.inputs else None)
+            if spec_name is not None:
+                bsdf.inputs[spec_name].default_value = sc[1]
+
     # UV-Map + Mapping node - lazily initialized only when at least one image
     # texture is actually created. This makes it visible in the shader editor
     # which UV map the textures use, and the user can change it if needed.

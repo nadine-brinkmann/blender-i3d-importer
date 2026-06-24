@@ -81,6 +81,7 @@ SPECIAL_ATTRS = {
     'referenceId',          # -> i3D_referenceFilename via Files map (in the importer)
     'referenceChildPath',   # -> i3D_referenceChildPath directly in the importer
                             #    (also when missing - exporter needs the key)
+    'splitUvs',             # -> i3D_splitMinU/V/MaxU/V + i3D_splitUvWorldScale
 }
 
 
@@ -252,6 +253,22 @@ def apply_attrs_to_object(obj, raw_attrs: Dict[str, str], report: Callable) -> N
     # the tree walk, no re-export fidelity 
     if 'skinBindNodeIds' in raw_attrs:
         obj['_i3d_skinBindNodeIds_raw'] = str(raw_attrs['skinBindNodeIds'])
+
+    # ---- Special case: splitUvs (tiled/atlas meshes, e.g. trees) ---------
+    # The i3d stores ONE combined attribute splitUvs="minU minV maxU maxV
+    # worldScale", but the Giants exporter rebuilds it from FIVE separate
+    # props (i3D_splitMinU/V/MaxU/V/splitUvWorldScale - i3d_export.py:1040).
+    # Without splitting it the re-export defaults splitUvs to "0 0 1 1 1".
+    # i3D_splitType (from the splitType attr) gates the export write.
+    if 'splitUvs' in raw_attrs:
+        _parts = str(raw_attrs['splitUvs']).split()
+        _keys = ('i3D_splitMinU', 'i3D_splitMinV', 'i3D_splitMaxU',
+                 'i3D_splitMaxV', 'i3D_splitUvWorldScale')
+        for _k, _p in zip(_keys, _parts):
+            try:
+                obj[_k] = float(_p)
+            except ValueError:
+                pass
 
     # ---- Standard mapping ------------------------------------------------
     for xml_attr, value in raw_attrs.items():
