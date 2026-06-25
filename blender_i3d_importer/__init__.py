@@ -656,6 +656,74 @@ class FS25_OT_sync_debug_to_export_material(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class FS25_OT_load_config_xml(Operator, ImportHelper):
+    """Load i3dMappings from a vehicle/placeable config XML and assign them to
+    the imported objects (sets I3D_XMLconfigID + I3D_XMLconfigBool so the Giants
+    exporter can re-write the <i3dMappings> block on export). Scoped to the
+    import of the active object."""
+    bl_idname = "fs25.load_config_xml"
+    bl_label = "Load Config XML (i3dMappings)"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    filename_ext = ".xml"
+    filter_glob: StringProperty(default="*.xml", options={'HIDDEN'})
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return obj is not None and obj.get('_i3d_import_id') is not None
+
+    def execute(self, context):
+        import_id = context.active_object.get('_i3d_import_id')
+        mappings = i3d_xml_parser.parse_i3d_mappings(self.filepath)
+        if not mappings:
+            self.report({'WARNING'}, "No <i3dMappings> found in this XML.")
+            return {'CANCELLED'}
+        by_path = {}
+        for mid, npath in mappings:
+            by_path.setdefault(npath, mid)
+        path_index = {}
+        for obj in context.scene.objects:
+            if obj.get('_i3d_import_id') != import_id:
+                continue
+            p = obj.get('_i3d_node_path')
+            if p:
+                path_index.setdefault(p, []).append(obj)
+        applied, unmatched = 0, 0
+        for npath, mid in by_path.items():
+            objs = path_index.get(npath)
+            if not objs:
+                unmatched += 1
+                continue
+            for obj in objs:
+                obj['I3D_XMLconfigID'] = mid
+                obj['I3D_XMLconfigBool'] = True
+                applied += 1
+        # Convenience: also register this XML in the Giants exporter's "XML Config
+        # Files" list (scene I3D_UIexportSettings.i3D_updateXMLFilePath, joined as
+        # ';path;;'), so the user does not have to pick the file a second time for
+        # "Update XML". No-op when the exporter is not installed. Casing differs:
+        # FS25 10.0.x uses i3D_*, FS22 9.x uses I3D_*.
+        exporter_note = ""
+        settings = getattr(context.scene, "I3D_UIexportSettings", None)
+        if settings is not None:
+            attr = ("i3D_updateXMLFilePath" if hasattr(settings, "i3D_updateXMLFilePath")
+                    else "I3D_updateXMLFilePath" if hasattr(settings, "I3D_updateXMLFilePath")
+                    else None)
+            if attr is not None:
+                abspath = bpy.path.abspath(self.filepath)
+                current = getattr(settings, attr)
+                if abspath not in current:
+                    setattr(settings, attr, current + ";{};;".format(abspath))
+                    exporter_note = "; added to Giants exporter XML Config Files"
+
+        msg = f"Applied {applied} i3dMapping(s) to import '{import_id}' from {len(by_path)} entries"
+        if unmatched:
+            msg += f"; {unmatched} had no matching object"
+        self.report({'INFO'}, msg + exporter_note + ".")
+        return {'FINISHED'}
+
+
 class FS25_PT_i3d_importer_panel(bpy.types.Panel):
     """N-Panel entry in the 3D Viewport sidebar with material-switch buttons."""
     bl_idname = "FS25_PT_i3d_importer_panel"
@@ -691,6 +759,25 @@ class FS25_PT_i3d_importer_panel(bpy.types.Panel):
         op_exp = box.operator("fs25.switch_materials", text="Export (all)")
         op_exp.target_kind = 'export'
         op_exp.scope = 'all_imported'
+
+        # i3dMappings: load a vehicle/placeable config XML and assign its
+        # <i3dMapping> ids to the imported objects (scoped to the active
+        # object's import). Greyed out until an imported object is active.
+        active = context.active_object
+        has_import = active is not None and active.get('_i3d_import_id') is not None
+        mbox = layout.box()
+        mbox.label(text="i3dMappings", icon='FILE_TEXT')
+        if has_import:
+            mbox.operator("fs25.load_config_xml", text="Load Config XML", icon='IMPORT')
+        else:
+            mbox.label(text="Select an imported object first", icon='INFO')
+
+        # Editable field for the active object's i3dMapping id, if assigned.
+        # The bracket path edits the IDProperty (dict) directly - the same
+        # storage the Giants exporter reads on export (obj["I3D_XMLconfigID"]),
+        # which the exporter's own RNA UI field fails to write in Blender 5.1+.
+        if active is not None and active.get('I3D_XMLconfigID') is not None:
+            mbox.prop(active, "i3d_importer_mapping_id", text="Mapping ID")
 
         # Tree season - shown only when the file actually has a
         # tree-branch debug material (treeBranchShader SEASONAL).
@@ -1054,6 +1141,33 @@ def _update_tree_season(self, context):
                 n.outputs[0].default_value = leaf_enable
 
 
+# --- Editable i3dMapping id proxy -------------------------------------------
+# The Giants exporter keeps the mapping id in TWO separate storages on Blender
+# 5.1+: the RNA property obj.I3D_XMLconfigID (shown in the exporter UI) and the
+# IDProperty obj["I3D_XMLconfigID"] (what the export actually reads). This proxy
+# writes BOTH, so our N-panel field stays in sync with the exporter field and
+# exports correctly with or without the exporter-side patch.
+def _i3d_mapping_id_get(self):
+    return self.get("I3D_XMLconfigID", "")
+
+
+def _i3d_mapping_id_set(self, value):
+    # The Giants exporter keeps this in two separate storages on Blender 5.1+,
+    # and its checkbox callback resets the id to the node name when toggled on.
+    # To get a custom id into the export reliably:
+    #   1) enable + set the RNA side first, so the exporter UI shows it (box on,
+    #      custom id) - setting the id AFTER the bool overrides the node-name reset;
+    #   2) always write the IDProperties the export actually reads, so it works
+    #      with or without the exporter patch and regardless of RNA/IDProp split.
+    try:
+        self.I3D_XMLconfigBool = True
+        self.I3D_XMLconfigID = value
+    except (AttributeError, TypeError):
+        pass                                  # exporter not installed - id-prop suffices
+    self["I3D_XMLconfigBool"] = 1
+    self["I3D_XMLconfigID"] = value
+
+
 def register():
     bpy.utils.register_class(FS25_OT_terrain_base_color_reset)
     bpy.utils.register_class(FS25I3DImporterPreferences)
@@ -1064,6 +1178,9 @@ def register():
     bpy.utils.register_class(FS25_OT_invisible_ge_show)
     bpy.utils.register_class(FS25_OT_invisible_ge_hide)
     bpy.utils.register_class(FS25_OT_sync_debug_to_export_material)
+    bpy.utils.register_class(FS25_OT_load_config_xml)
+    bpy.types.Object.i3d_importer_mapping_id = StringProperty(
+        name="Mapping ID", get=_i3d_mapping_id_get, set=_i3d_mapping_id_set)
     bpy.utils.register_class(FS25_PT_i3d_importer_panel)
     # Sub-panel order (top -> bottom in the N-Panel):
     #   1. FS25 Snow + Ice
@@ -1117,6 +1234,8 @@ def unregister():
     bpy.utils.unregister_class(FS25_PT_invisible_ge_objects)
     bpy.utils.unregister_class(FS25_PT_snow_heaps)
     bpy.utils.unregister_class(FS25_PT_i3d_importer_panel)
+    del bpy.types.Object.i3d_importer_mapping_id
+    bpy.utils.unregister_class(FS25_OT_load_config_xml)
     bpy.utils.unregister_class(FS25_OT_sync_debug_to_export_material)
     bpy.utils.unregister_class(FS25_OT_invisible_ge_hide)
     bpy.utils.unregister_class(FS25_OT_invisible_ge_show)

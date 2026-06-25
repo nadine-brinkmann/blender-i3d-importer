@@ -327,9 +327,9 @@ def import_i3d(i3d_filepath: str, report: Callable = None,
             _collect_skinweight_excluded_ids(roots_to_process, _skin_excluded_ids)
             _apply_sort_order_prefix(roots_to_process, _skin_excluded_ids)
 
-        for root in roots_to_process:
+        for ri, root in enumerate(roots_to_process):
             _build_node(root, parent=None, collection=import_collection,
-                        scene=scene,
+                        scene=scene, node_path=f"{ri}>",
                         mesh_cache=mesh_cache, material_cache=material_cache,
                         image_cache=image_cache, shader_cache=shader_cache,
                         shape_map=shape_map, spline_map=spline_map,
@@ -348,6 +348,11 @@ def import_i3d(i3d_filepath: str, report: Callable = None,
         _process_merge_children(import_collection, shape_map, shape_id_to_obj, _report)
         _process_skin_weights(import_collection, shape_map, shape_id_to_obj, _report)
         _process_skin_bindings(import_collection, _report)
+
+        # Group key per import so a later "Load Config XML" can scope its
+        # i3dMapping join to exactly this import (node paths repeat across imports).
+        for obj in import_collection.all_objects:
+            obj['_i3d_import_id'] = import_collection.name
 
         # axis correction Y-up -> Z-up after the complete hierarchy is
         # built (so all top-level objects exist and the wrapper-empty trick works).
@@ -558,7 +563,7 @@ def _apply_sort_order_prefix(nodes, excluded=None):
 def _build_node(node, parent, collection, scene, mesh_cache, material_cache,
                 image_cache, shader_cache, shape_map, spline_map, shape_id_to_obj,
                 i3d_dir, counts, terrain_lod, terrain_base_color,
-                terrain_poc_layer_names, objects_to_hide, report):
+                terrain_poc_layer_names, objects_to_hide, report, node_path=""):
     """Recursively create the object for `node`, parent it, then walk children."""
     if node.kind == 'Shape':
         obj = _create_mesh_object(node, scene, mesh_cache, material_cache,
@@ -593,6 +598,8 @@ def _build_node(node, parent, collection, scene, mesh_cache, material_cache,
         collection.objects.link(obj)
         _apply_transform(obj, node, parent)
         _set_meta_props(obj, node, scene, report)
+        if node_path:
+            obj['_i3d_node_path'] = node_path
         if parent is not None:
             obj.parent = parent
         # collect hide check (applied later, after axis correction).
@@ -604,7 +611,8 @@ def _build_node(node, parent, collection, scene, mesh_cache, material_cache,
             obj['_i3d_invisible_in_ge'] = True
         next_parent = obj
 
-    for child in node.children:
+    for ci, child in enumerate(node.children):
+        child_path = f"{node_path}{ci}" if node_path.endswith('>') else f"{node_path}|{ci}"
         _build_node(child, parent=next_parent, collection=collection, scene=scene,
                     mesh_cache=mesh_cache, material_cache=material_cache,
                     image_cache=image_cache, shader_cache=shader_cache,
@@ -614,7 +622,8 @@ def _build_node(node, parent, collection, scene, mesh_cache, material_cache,
                     terrain_lod=terrain_lod,
                     terrain_base_color=terrain_base_color,
                     terrain_poc_layer_names=terrain_poc_layer_names,
-                    objects_to_hide=objects_to_hide, report=report)
+                    objects_to_hide=objects_to_hide, report=report,
+                    node_path=child_path)
 
 
 def _create_mesh_object(node, scene, mesh_cache, material_cache, image_cache,

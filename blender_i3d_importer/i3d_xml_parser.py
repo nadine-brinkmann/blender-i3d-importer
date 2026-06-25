@@ -358,3 +358,23 @@ def _parse_combined_layer(elem: ET.Element) -> I3DCombinedLayer:
         noise_frequency  = _to_float(a.get('noiseFrequency'), 2.0),
         raw_attrs        = {k: v for k, v in a.items() if k not in consumed},
     )
+
+
+def parse_i3d_mappings(filepath) -> List[Tuple[str, str]]:
+    """Read the <i3dMappings> block from a vehicle/placeable config XML.
+
+    Returns a list of (id, node_path) tuples, e.g. ('wheelFrontLeft', '0>0|1|0').
+    Empty list if the file is unparseable or contains no mappings. node_path may
+    be '0>' for a component root, which is a valid (non-empty) path.
+    """
+    try:
+        tree = ET.parse(str(filepath))
+    except (ET.ParseError, OSError):
+        return []
+    result = []
+    for m in tree.getroot().iter('i3dMapping'):
+        mid = m.get('id')
+        node = m.get('node')
+        if mid and node is not None:
+            result.append((mid, node))
+    return result
