@@ -689,11 +689,12 @@ class FS25_OT_load_config_xml(Operator, ImportHelper):
             p = obj.get('_i3d_node_path')
             if p:
                 path_index.setdefault(p, []).append(obj)
-        applied, unmatched = 0, 0
+        applied = 0
+        unmatched = []
         for npath, mid in by_path.items():
             objs = path_index.get(npath)
             if not objs:
-                unmatched += 1
+                unmatched.append(mid)
                 continue
             for obj in objs:
                 obj['I3D_XMLconfigID'] = mid
@@ -717,9 +718,17 @@ class FS25_OT_load_config_xml(Operator, ImportHelper):
                     setattr(settings, attr, current + ";{};;".format(abspath))
                     exporter_note = "; added to Giants exporter XML Config Files"
 
+        if unmatched:
+            # Nothing is silently lost: list the ids that found no matching object.
+            # Most commonly these target a skinned bone/joint, which is not assigned
+            # (bones are a rare i3dMapping target - see notes).
+            self.report(
+                {'WARNING'},
+                "%d i3dMapping(s) not assigned (no matching object - e.g. a "
+                "skinned bone/joint): %s" % (len(unmatched), ", ".join(unmatched)))
         msg = f"Applied {applied} i3dMapping(s) to import '{import_id}' from {len(by_path)} entries"
         if unmatched:
-            msg += f"; {unmatched} had no matching object"
+            msg += f"; {len(unmatched)} not assigned (see warning)"
         self.report({'INFO'}, msg + exporter_note + ".")
         return {'FINISHED'}
 

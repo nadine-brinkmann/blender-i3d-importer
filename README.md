@@ -60,6 +60,7 @@ modify, and (mostly) round-trip back into the Giants Editor through the Giants i
 - **FS25 Snow + Ice** — show/hide all snow/icicle meshes; reminds you to un-hide them before re-export
 - **FS25 Invisible GE-objects** — show/hide all objects that were auto-hidden because they are invisible in the Giants Editor (e.g. collision volumes); reminds you to un-hide them before re-export
 - **Tree Season** - for imported trees, switch the seasonal leaf debug look (Summer / Autumn / Winter / Spring); appears only when a tree-branch material is present in the scene
+- **i3dMappings** - load a vehicle/placeable config XML and assign its `<i3dMapping>` ids to the imported objects, then view and edit a node's **Mapping ID** (written so the Giants exporter picks it up on re-export); also fills the exporter's *XML Config Files* list so you only pick the file once
 
 ### Convenience after import
 
@@ -125,6 +126,10 @@ The re-export materials are designed to round-trip cleanly through the official 
 
 See [`blender_i3d_importer/patches/README.md`](blender_i3d_importer/patches/README.md) for application steps (a few-line edit in two files of the exporter, detailed instructions included).
 
+### i3dMappings (vehicle / placeable config)
+
+Vehicle and placeable config XMLs reference nodes in the i3d through an `<i3dMappings>` block, which lives in the XML, not in the i3d. After import, open the **i3dMappings** box in the i3d Importer tab, click **Load Config XML**, and pick the matching `vehicle.xml` / `placeable.xml`: the importer assigns each mapping id to the right object and fills the exporter's *XML Config Files* list. You can then view and edit a node's **Mapping ID** in the same box - this works around a Giants exporter bug on Blender 5.1+ where the exporter's own field cannot set a custom id. See the [i3dMappings wiki page](https://github.com/nadine-brinkmann/blender-i3d-importer/wiki/i3dMappings).
+
 **Before re-export, remember:**
 
 - If you used the **Material Settings** sliders, click **Sync to Export Material** so the changes are persisted on the export materials.
@@ -136,6 +141,7 @@ See [`blender_i3d_importer/patches/README.md`](blender_i3d_importer/patches/READ
 - **Terrain is one-way.** The Giants Blender Exporter cannot emit a `<TerrainTransformGroup>`. The terrain mesh is for in-Blender preview / backgroundMesh-snapping only. The importer prints a WARNING in the log when terrain is loaded.
 - **Reference-node recursion.** Sub-i3ds referenced by a node are not loaded automatically; they remain as empties with the original `i3D_referenceFilename` custom property. The Giants exporter writes them back correctly on re-export, but only if you apply the `referenceChildPath`-patch (see above).
 - **Skinned-mesh armature leftover.** Re-exporting a skinned mesh leaves one empty `armature` transform group in the scenegraph (the Giants exporter does not collapse armatures). It is harmless and can be deleted in the Giants Editor; the joints themselves round-trip to their original place via "Child Of" constraints.
+- **i3dMappings on bones are not assigned.** When you load a config XML, mappings that target a skinned bone/joint (rare) are not assigned to any object; the importer lists them in a warning so nothing is lost silently. All mappings that target regular objects, including merge-group members, are assigned.
 
 ## License and attribution
 
