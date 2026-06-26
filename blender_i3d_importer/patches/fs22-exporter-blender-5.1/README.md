@@ -71,8 +71,12 @@ I will explain the fixes manually, but there is also an advanced version below i
 
 ### Fix 2 - file `util/selectionUtil.py`
 
+This file needs **two edits**, both in the same file. Open `util/selectionUtil.py` once, make both changes, then save.
+
+#### Edit 2a - function `getSelectedObjects`
+
 1. Go into the `util` folder and **open the file** `selectionUtil.py`.
-2. **Find the block** near the bottom of the file that starts with `def getSelectedObjects(context):`. It looks exactly like this:
+2. **Find the block** near the bottom of the file that starts with `def getSelectedObjects(context):`. It looks like this:
 
 ```python
 def getSelectedObjects(context):
@@ -117,9 +121,64 @@ def getSelectedObjects(context):
 
     return selected_items
 ```
-4. Save, then close the file.
 
 *(This lets the exporter read your selected objects on Blender 4.x/5.x.)*
+
+#### Edit 2b - function `get_outliner_selected_nodes`
+
+The export ("Export Selected") reads your selection through this function. In the 9.1.0 exporter it pokes Blender's internal memory (ctypes), which **crashes Blender 5.1**. We replace it with the safe one-liner the official 10.0.2 exporter uses.
+
+1. In the **same file**, **find the function** `get_outliner_selected_nodes`. It is a long block that looks like this:
+
+```python
+def get_outliner_selected_nodes():
+    """ Returns all hidden objects selected in the outliner for Blender 2.83 LTS"""
+
+    _so = None
+    for win in bpy.context.window_manager.windows:
+        for ar in win.screen.areas:
+            if ar.type == 'OUTLINER':
+                _so = ar.spaces.active
+    if _so is None:
+        print('so is None')
+        return
+    root = TreeElement.from_outliner(_so)
+    # wmstruct = wmWindowManager.from_address(bpy.context.window_manager.as_pointer())
+    # Track processed objects to prevent those that appear in multiple
+    # collections from being processed again.
+    walked = set()
+    types = {ID_OB, ID_LAYERCOLL}
+    try:
+        for tree in subtrees_get(root):
+            if tree.select and tree.idcode in types:
+                obj = tree.as_object(root)
+                if obj in walked:
+                    continue
+                walked.add(obj)
+    except ValueError as e:
+        pass
+        #print(e)
+    except KeyError as e:
+        pass
+        #print(e)
+    root = None
+    return list(walked)
+```
+
+2. **Replace the whole function with:**
+
+```python
+def get_outliner_selected_nodes():
+    """ Returns objects selected in the outliner, including hidden ones.
+    Uses obj.select_get() which reflects selection state regardless of visibility,
+    avoiding context-override quirks across Blender versions. """
+
+    return [obj for obj in bpy.context.view_layer.objects if obj.select_get()]
+```
+
+3. Save, then close the file.
+
+*(Edit 2b fixes the crash on "Export Selected". Both edits mirror the official 10.0.2 exporter.)*
 
 ### Fix 3 - file `dcc/dccBlender.py` in **two** places
 
@@ -149,14 +208,14 @@ def getSelectedObjects(context):
 ## Step 4 - Apply the three fixes with a patch tool (Advanced alternative (optional!))
 ***If you already did the manual fixes above, skip this step! You are done with the fixes. Proceed to Step 5!***
 
-Instead of editing by hand you can apply the supplied `.patch` files with the `patch` tool (Git Bash / Linux / WSL):
+Instead of editing by hand you can apply the supplied `.patch` files with the `patch` tool (Git Bash / Linux / WSL). The patch files use Windows (CRLF) line endings, so `--binary` is required:
 > ```bash
 > cd io_export_i3d
-> patch -p0 < 01-panel-init-args.patch
-> patch -p0 < 02-getselectedobjects-outliner-region.patch
-> patch -p0 < 03-calc-normals-split-guard.patch
+> patch --binary -p0 < 01-panel-init-args.patch
+> patch --binary -p0 < 02-getselectedobjects-outliner-region.patch
+> patch --binary -p0 < 03-calc-normals-split-guard.patch
 > ```
-> The source files use Windows (CRLF) line endings; if `patch` complains, add `--binary`, or use the manual edits above instead.
+> The `--binary` flag is required: without it `patch` strips the carriage returns from the patch and the hunks no longer match the CRLF source files. If you still run into trouble, use the manual edits above instead.
 
 ## Step 5 - Zip it back up and install it in Blender 5.1
 

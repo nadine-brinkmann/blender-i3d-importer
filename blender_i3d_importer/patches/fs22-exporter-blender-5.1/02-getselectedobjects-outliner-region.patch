@@ -1,26 +1,67 @@
 --- util/selectionUtil.py	(original, io_export_i3d 9.1.0)
-+++ util/selectionUtil.py	(patched - Blender 5.1: selected_ids needs OUTLINER region)
-@@ -329,14 +329,22 @@
++++ util/selectionUtil.py	(patched - Blender 5.1: crash-safe outliner selection + selected_ids region)
+@@ -256,37 +256,11 @@
+     return trees[1:]
+ 
+ def get_outliner_selected_nodes():
+-    """ Returns all hidden objects selected in the outliner for Blender 2.83 LTS"""
++    """ Returns objects selected in the outliner, including hidden ones.
++    Uses obj.select_get() which reflects selection state regardless of visibility,
++    avoiding context-override quirks across Blender versions. """
+ 
+-    _so = None
+-    for win in bpy.context.window_manager.windows:
+-        for ar in win.screen.areas:
+-            if ar.type == 'OUTLINER':
+-                _so = ar.spaces.active
+-    if _so is None:
+-        print('so is None')
+-        return
+-    root = TreeElement.from_outliner(_so)
+-    # wmstruct = wmWindowManager.from_address(bpy.context.window_manager.as_pointer())
+-    # Track processed objects to prevent those that appear in multiple
+-    # collections from being processed again.
+-    walked = set()
+-    types = {ID_OB, ID_LAYERCOLL}
+-    try:
+-        for tree in subtrees_get(root):
+-            if tree.select and tree.idcode in types:
+-                obj = tree.as_object(root)
+-                if obj in walked:
+-                    continue
+-                walked.add(obj)
+-    except ValueError as e:
+-        pass
+-        #print(e)
+-    except KeyError as e:
+-        pass
+-        #print(e)
+-    root = None
+-    return list(walked)
++    return [obj for obj in bpy.context.view_layer.objects if obj.select_get()]
+ 
+ def atoi(text):
+     return int(text) if text.isdigit() else text
+@@ -329,17 +303,22 @@
  def getSelectedObjects(context):
      # get active object from outliner context
      # this also includes hidden objects like collision etc
--    for area in context.screen.areas:
--        if area.type == 'OUTLINER':
+-
++    # Blender 4.x/5.x: context.selected_ids is only available when the
++    # temp_override also carries the OUTLINER region (not just the area).
++    # Mirrors the fix in the official 10.0.2 exporter.
++    selected_items = []
+     for area in context.screen.areas:
+         if area.type == 'OUTLINER':
 -            override = context.copy()
 -            override['area'] = area
+-
 -            with bpy.context.temp_override(area=area):
 -                if len(context.selected_ids) == 0:
 -                    if len(context.selected_objects) > 0:
 -                        return context.selected_objects
 -                else:
 -                    return context.selected_ids
--    return []
-+    # Blender 4.x/5.x: context.selected_ids is only available when the
-+    # temp_override also carries the OUTLINER region (not just the area).
-+    # Mirrors the fix in the official 10.0.2 exporter.
-+    selected_items = []
-+    for area in context.screen.areas:
-+        if area.type == 'OUTLINER':
 +            try:
 +                context_override = {}
 +                context_override['area'] = area
@@ -32,5 +73,6 @@
 +                print(f"An exception occurred: {e}")
 +    if not selected_items:
 +        selected_items.extend(context.selected_objects)
-+
+ 
+-    return []
 +    return selected_items
