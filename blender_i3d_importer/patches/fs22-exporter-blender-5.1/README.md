@@ -7,6 +7,9 @@ This guide walks you through getting it running on Blender 5.1 so you can **re-e
 
 We make the three small edits **first** and only then install the add-on. That way you end up with a ready-patched `.zip` you can keep and reinstall any time (for example in a fresh Blender install) without redoing the edits.
 
+You can also follow this video, it mirrors the contents of this page:
+<a href="https://youtu.be/UQn2G0sv9Go" target="_blank" rel="noopener"><img src="https://img.youtube.com/vi/UQn2G0sv9Go/maxresdefault.jpg" alt="i3d Importer trailer" width="48%"></a>
+
 ---
 
 ## Step 1 - Download the exporter (9.1.0)
@@ -69,7 +72,7 @@ I will explain the fixes manually, but there is also an advanced version below i
 
 *(This fix lets the Exporter's panel start correctly on Blender 4.0+.)*
 
-### Fix 2 - file `util/selectionUtil.py`
+### Fix 2 - file `util/selectionUtil.py` in **two** places
 
 This file needs **two edits**, both in the same file. Open `util/selectionUtil.py` once, make both changes, then save.
 
@@ -126,7 +129,7 @@ def getSelectedObjects(context):
 
 #### Edit 2b - function `get_outliner_selected_nodes`
 
-The export ("Export Selected") reads your selection through this function. In the 9.1.0 exporter it pokes Blender's internal memory (ctypes), which **crashes Blender 5.1**. We replace it with the safe one-liner the official 10.0.2 exporter uses.
+> **Be aware! This part is not in the video** because it was found only after the video. But it's the same procedure, search, highlight, replace.
 
 1. In the **same file**, **find the function** `get_outliner_selected_nodes`. It is a long block that looks like this:
 
@@ -178,7 +181,7 @@ def get_outliner_selected_nodes():
 
 3. Save, then close the file.
 
-*(Edit 2b fixes the crash on "Export Selected". Both edits mirror the official 10.0.2 exporter.)*
+*(Edit 2b fixes the crash on "Export Selected". This export reads your selection through this function. In the 9.1.0 exporter it pokes Blender's internal memory (ctypes), which **crashes Blender 5.1**. We replace it with the safe one-liner the official 10.0.2 exporter uses. Both edits mirror the official 10.0.2 exporter.)*
 
 ### Fix 3 - file `dcc/dccBlender.py` in **two** places
 
