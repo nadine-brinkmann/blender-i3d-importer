@@ -21,11 +21,8 @@ copyright = [
     "2026 Nadine Brinkmann",
 ]
 
-# Only Windows because of the bundled native .NET 6 binary (bin/i3dToObjx.exe)
-platforms = ["windows-x64"]
-
 [permissions]
-files = "Read i3d files, textures, and shader XMLs from disk; write temporary OBJx files during import"
+files = "Read i3d files, textures, and XMLs from disk"
 
 [build]
 paths_exclude_pattern = [
