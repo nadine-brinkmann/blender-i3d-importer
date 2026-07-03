@@ -327,9 +327,9 @@ def import_i3d(i3d_filepath: str, report: Callable = None,
             _collect_skinweight_excluded_ids(roots_to_process, _skin_excluded_ids)
             _apply_sort_order_prefix(roots_to_process, _skin_excluded_ids)
 
-        for root in roots_to_process:
+        for ri, root in enumerate(roots_to_process):
             _build_node(root, parent=None, collection=import_collection,
-                        scene=scene,
+                        scene=scene, node_path=f"{ri}>",
                         mesh_cache=mesh_cache, material_cache=material_cache,
                         image_cache=image_cache, shader_cache=shader_cache,
                         shape_map=shape_map, spline_map=spline_map,
@@ -349,6 +349,11 @@ def import_i3d(i3d_filepath: str, report: Callable = None,
         _process_skin_weights(import_collection, shape_map, shape_id_to_obj, _report)
         _process_skin_bindings(import_collection, _report)
 
+        # Group key per import so a later "Load Config XML" can scope its
+        # i3dMapping join to exactly this import (node paths repeat across imports).
+        for obj in import_collection.all_objects:
+            obj['_i3d_import_id'] = import_collection.name
+
         # axis correction Y-up -> Z-up after the complete hierarchy is
         # built (so all top-level objects exist and the wrapper-empty trick works).
         if apply_axis_correction:
@@ -365,6 +370,11 @@ def import_i3d(i3d_filepath: str, report: Callable = None,
         # finalized the bone rest matrices (else the constraint is non-neutral
         # and deforms the skinned mesh at rest - #6).
         _finalize_skin_childof(import_collection, _report)
+
+        # Re-parent chained skin joints (bind joint under bind joint) via real
+        # bone parenting now that axis correction has finalized the bone rests
+        # (Giants exporter chain support; see _process_skin_weights stash).
+        _finalize_skin_chains(import_collection, _report)
 
         # apply hide AFTER axis correction. hide_set matches the H
         # shortcut (view-layer eye). On Giants re-export this leads to
@@ -429,12 +439,20 @@ def import_i3d(i3d_filepath: str, report: Callable = None,
         #   - i3D_exportFileLocation = EXPORT_DIR + basename of the imported i3d
         try:
             settings = bpy.context.scene.I3D_UIexportSettings
-            settings.i3D_gameLocationDisplay = FS25_DATA_BASE.rstrip("\\/") + "\\"
-            settings.i3D_exportUseSoftwareFileName = False
+            # FS25 10.0.x exporter registers lowercase i3D_* UI field names,
+            # FS22 9.1.0 uses uppercase I3D_* (same field stems, same scene
+            # group I3D_UIexportSettings). Pick whichever casing the installed
+            # exporter actually has, otherwise the first assignment raises
+            # AttributeError on FS22 and the whole setup is skipped silently.
+            pfx = 'i3D_' if hasattr(settings, 'i3D_gameLocationDisplay') else 'I3D_'
+            setattr(settings, pfx + 'gameLocationDisplay',
+                    FS25_DATA_BASE.rstrip("\\/") + "\\")
+            setattr(settings, pfx + 'exportUseSoftwareFileName', False)
             if EXPORT_DIR:
-                settings.i3D_exportFileLocation = str(Path(EXPORT_DIR) / i3d.name)
+                setattr(settings, pfx + 'exportFileLocation',
+                        str(Path(EXPORT_DIR) / i3d.name))
                 _report('INFO',
-                        f"Giants exporter configured: "
+                        f"Giants exporter configured ({pfx}): "
                         f"gameLocation={FS25_DATA_BASE}, exportFile={i3d.name}")
             else:
                 _report('INFO',
@@ -480,12 +498,12 @@ def _has_any_shape_nodes(node) -> bool:
 
 
 def _strip_sort_prefix(name):
-    """Remove a leading 4-digit sort-order prefix ('0010:') added by
+    """Remove a leading sort-order prefix ('0010:' or '0010.<nodeId>:') added by
     _apply_sort_order_prefix. Used when deriving bone names from object names:
     the Giants exporter writes bone names verbatim (getBoneData does NOT strip
     the ':' prefix, unlike object node names), so a prefixed bone name would
     leak into the .i3d. No-op when the prefix feature is off."""
-    return re.sub(r"^\d{4}:", "", name or "")
+    return re.sub(r"^\d{4}(?:\.\d+)?:", "", name or "")
 
 
 def _collect_skinweight_excluded_ids(nodes, excluded):
@@ -529,7 +547,15 @@ def _apply_sort_order_prefix(nodes, excluded=None):
     for i, node in enumerate(nodes):
         if node.nodeId not in excluded:
             clean = (node.name or "").replace(":", ".")
-            node.name = f"{(i + 1) * 10:04d}:{clean}"
+            # (i+1)*10 governs sibling order (alphabetical == numeric on the
+            # zero-padded leading digits). nodeId is appended as a globally
+            # unique disambiguator so identical names at the same sibling index
+            # under different parents do NOT collide as Blender object names
+            # (Blender would append '.001', which survives re-export because the
+            # exporter only strips up to the last ':'). nodeId never affects
+            # ordering: within one parent every sibling already has a distinct
+            # leading number, so the nodeId part is never compared. GitHub #34.
+            node.name = f"{(i + 1) * 10:04d}.{node.nodeId}:{clean}"
         if node.children:
             _apply_sort_order_prefix(node.children, excluded)
 
@@ -537,7 +563,7 @@ def _apply_sort_order_prefix(nodes, excluded=None):
 def _build_node(node, parent, collection, scene, mesh_cache, material_cache,
                 image_cache, shader_cache, shape_map, spline_map, shape_id_to_obj,
                 i3d_dir, counts, terrain_lod, terrain_base_color,
-                terrain_poc_layer_names, objects_to_hide, report):
+                terrain_poc_layer_names, objects_to_hide, report, node_path=""):
     """Recursively create the object for `node`, parent it, then walk children."""
     if node.kind == 'Shape':
         obj = _create_mesh_object(node, scene, mesh_cache, material_cache,
@@ -570,8 +596,10 @@ def _build_node(node, parent, collection, scene, mesh_cache, material_cache,
         next_parent = parent
     else:
         collection.objects.link(obj)
-        _apply_transform(obj, node)
+        _apply_transform(obj, node, parent)
         _set_meta_props(obj, node, scene, report)
+        if node_path:
+            obj['_i3d_node_path'] = node_path
         if parent is not None:
             obj.parent = parent
         # collect hide check (applied later, after axis correction).
@@ -583,7 +611,8 @@ def _build_node(node, parent, collection, scene, mesh_cache, material_cache,
             obj['_i3d_invisible_in_ge'] = True
         next_parent = obj
 
-    for child in node.children:
+    for ci, child in enumerate(node.children):
+        child_path = f"{node_path}{ci}" if node_path.endswith('>') else f"{node_path}|{ci}"
         _build_node(child, parent=next_parent, collection=collection, scene=scene,
                     mesh_cache=mesh_cache, material_cache=material_cache,
                     image_cache=image_cache, shader_cache=shader_cache,
@@ -593,7 +622,8 @@ def _build_node(node, parent, collection, scene, mesh_cache, material_cache,
                     terrain_lod=terrain_lod,
                     terrain_base_color=terrain_base_color,
                     terrain_poc_layer_names=terrain_poc_layer_names,
-                    objects_to_hide=objects_to_hide, report=report)
+                    objects_to_hide=objects_to_hide, report=report,
+                    node_path=child_path)
 
 
 def _create_mesh_object(node, scene, mesh_cache, material_cache, image_cache,
@@ -748,11 +778,25 @@ def _build_mesh_datablock(shape, datablock_name, node, scene, material_cache,
                     color_layer.data[loop_idx].color = md.vertex_colors[v_idx]
                 loop_idx += 1
 
-    # Material slots: one slot per materialId from the XML node.
-    for mat_id in node.materialIds:
+    # Material slots: one slot per materialId from the XML node. Carry the
+    # per-subset material slot name (read from the .i3d.shapes binary) onto the
+    # Blender material as the 'materialSlotName' IDProperty. The Giants exporter
+    # reads exactly this property (dcc/dccBlender.getShapeMaterials) and writes
+    # it back into the re-exported shapes. Without it the slot name is lost on
+    # re-export, breaking vehicle design/color configs that reference a material
+    # by slot name (e.g. <material materialSlotName="main_chassis_color_mat"/>):
+    # the engine's MaterialUtil.getMaterialBySlotName can no longer find it.
+    # The name lives on the shared material datablock, so merge-child sub-meshes
+    # (which reuse these materials) inherit it automatically.
+    _slot_names = getattr(shape, 'material_slot_names', None) or []
+    for _slot_idx, mat_id in enumerate(node.materialIds):
         mat = _get_or_create_material(
             mat_id, scene, material_cache, image_cache, shader_cache, i3d_dir, report
         )
+        if _slot_idx < len(_slot_names):
+            _sname = _slot_names[_slot_idx]
+            if _sname:
+                mat['materialSlotName'] = _sname
         mesh.materials.append(mat)
 
     # Set polygon.material_index per face.
@@ -1539,8 +1583,14 @@ def _create_light_object(node, report):
                    f"Light '{node.name}' invalid range='{range_str}'")
 
     shadow_str = raw.get('castShadowMap')
-    if shadow_str is not None:
-        light_data.use_shadow = str(shadow_str).strip().lower() in ('true', '1', 'yes')
+    # FS i3d omits castShadowMap for non-shadow lights. Blender's default
+    # use_shadow is True, so set False explicitly when absent - otherwise the
+    # Giants exporter emits castShadowMap="true" for every light and the
+    # Giants Editor shows them as shadow-casting (pink cone) instead of yellow.
+    light_data.use_shadow = (
+        str(shadow_str).strip().lower() in ('true', '1', 'yes')
+        if shadow_str is not None else False
+    )
 
     if blender_type == 'SPOT':
         cone_str = raw.get('coneAngle')
@@ -1617,7 +1667,7 @@ def _create_camera_object(node, report):
     return bpy.data.objects.new(name=node.name, object_data=camera_data)
 
 
-def _apply_transform(obj, node):
+def _apply_transform(obj, node, parent=None):
     """Translation 1:1, rotation Y-up -> Z-up converted, scale 1:1.
 
     XML rotation values come from the FS25 (Y-up) coordinate system. The
@@ -1635,6 +1685,15 @@ def _apply_transform(obj, node):
     post-mult that compensates Blender's local-Z-forward light convention
     against FS25's Y-up local-Z-forward convention. The importer mirrors that
     with an extra @ R_x(+90) post-mult so the round-trip is symmetric.
+
+    Nested Light/Camera (parent is ALSO Light/Camera): the exporter applies a
+    SECOND correction (dccBlender.py:1287-1288) - a parent pre-mult R_x(+90).
+    Together with the self post-mult R_x(-90) and the bake() they cancel, so
+    the exporter passes this node's matrix_local through UNCHANGED. We must
+    therefore store the RAW Y-up XML rotation here (no M-conjugation, no self
+    +90); otherwise the child light re-exports +90 deg off about X and its
+    spot cone points the wrong way (#31 - scattered lightsources on nested
+    lights). Translation stays raw (already correct) for the same reason.
     """
     import mathutils
     obj.location = node.translation
@@ -1649,8 +1708,12 @@ def _apply_transform(obj, node):
     R_blender = M @ R_xml @ M.inverted()
 
     if obj.type in ('LIGHT', 'CAMERA'):
-        R_x_plus90 = mathutils.Matrix.Rotation(math.radians(90), 4, 'X')
-        R_blender = R_blender @ R_x_plus90
+        if parent is not None and parent.type in ('LIGHT', 'CAMERA'):
+            # Exporter passes nested-light matrix_local through unchanged.
+            R_blender = R_xml
+        else:
+            R_x_plus90 = mathutils.Matrix.Rotation(math.radians(90), 4, 'X')
+            R_blender = R_blender @ R_x_plus90
 
     obj.rotation_euler = R_blender.to_euler('XYZ')
     obj.scale = node.scale
@@ -1876,16 +1939,35 @@ def _build_material(material_id, scene, image_cache, shader_cache, i3d_dir, repo
             bsdf.inputs['Alpha'].default_value = rgba[3]
             mat.blend_method = 'BLEND'
 
-    # alphaBlending material attribute -> blend_method='BLEND'. The Giants
-    # exporter derives <Material alphaBlending="true"> SOLELY from
-    # mat.blend_method == 'BLEND' (io_export_i3d .../dcc/dccBlender.py:1740),
-    # so without this the flag is dropped on re-export and transparent
-    # surfaces (glass, light lenses) turn opaque/invisible in the Giants
-    # Editor. Independent of diffuse alpha: glass usually carries
-    # alphaBlending="true" with a fully opaque diffuse color, so the
-    # rgba[3] < 1.0 branch above never fires for it.
-    if str(mat_attrs.get('alphaBlending', '')).strip().lower() in ('true', '1', 'yes'):
-        mat.blend_method = 'BLEND'
+    # (alphaBlending -> blend_method='BLEND' is handled canonically in
+    # _apply_material_custom_properties below, upstream fix for #33.)
+
+    # specularColor roundtrip. FS25 reads <Material specularColor> as
+    # (smoothness, bakedAO, metalness) - baseShader.ogsfx getSpecular(). The
+    # Giants Blender exporter writes it back as (1 - Roughness,
+    # "Specular IOR Level", Metallic) - dccBlender.py - i.e. it overloads the
+    # BSDF "Specular IOR Level" input as the carrier for the bakedAO value. We
+    # never set these on import, so the exporter regenerated specularColor from
+    # BSDF defaults -> wrong/added specularColor on nearly every material
+    # (QA harness 2026-06-24). Set them here so the re-export is exact. This is
+    # the re-export ("data") material; its own viewport look is secondary (the
+    # PBR debug material carries the FS look). The exporter reads default_value
+    # even when Roughness is glossmap-linked (its is_linked check is disabled),
+    # so the roundtrip stays correct.
+    spec = mat_attrs.get('specularColor')
+    if spec:
+        try:
+            sc = [float(x) for x in str(spec).split()]
+        except ValueError:
+            sc = []
+        if len(sc) >= 3:
+            bsdf.inputs['Roughness'].default_value = max(0.0, min(1.0, 1.0 - sc[0]))
+            if 'Metallic' in bsdf.inputs:
+                bsdf.inputs['Metallic'].default_value = sc[2]
+            spec_name = ('Specular IOR Level' if 'Specular IOR Level' in bsdf.inputs
+                         else 'Specular' if 'Specular' in bsdf.inputs else None)
+            if spec_name is not None:
+                bsdf.inputs[spec_name].default_value = sc[1]
 
     # UV-Map + Mapping node - lazily initialized only when at least one image
     # texture is actually created. This makes it visible in the shader editor
@@ -2044,6 +2126,19 @@ def _apply_material_custom_properties(mat, mat_attrs, scene, report, mat_name):
     csv = mat_attrs.get('customShaderVariation')
     if csv:
         mat['customShaderVariation'] = str(csv)
+
+    # alphaBlending: the i3d material attribute maps to Blender's blend_method.
+    # The Giants exporter derives alphaBlending solely from
+    # mat.blend_method == 'BLEND' (dccBlender.py:1753-1754); it does NOT read an
+    # IDProperty. Without setting blend_method here the flag is lost on re-export
+    # (new materials default to 'HASHED'), which breaks transparent light-glass
+    # lenses etc. Verified Blender 5.1.2: blend_method still exists ('BLEND' opt).
+    ab = mat_attrs.get('alphaBlending')
+    if isinstance(ab, str) and ab.strip().lower() == 'true':
+        try:
+            mat.blend_method = 'BLEND'
+        except Exception:
+            pass
 
     # customParameter_<name> for each <CustomParameter name="..." value="..."/>
     for cp in mat_attrs.get('_customparameters', []):
@@ -2491,6 +2586,98 @@ def _compute_xml_world_translation(obj):
     return pos
 
 
+def _finalize_skin_chains(import_collection, report):
+    """Re-create joint CHAINS (a bind joint parented to another bind joint, e.g.
+    HW180V9) via real bone parenting, AFTER axis correction has finalized the
+    bone rests. The Giants exporter only honours bone parenting for chains
+    (boneHasParentBone, i3d_export.py:1523) and computes the child relative to
+    the parent bone, so the correct rest depends on the post-axis parent bone
+    matrix. _process_skin_weights stashed the per-chain plan (child bone, parent
+    bone, matrix_exp) on the armature as '_i3d_chainfix'. We set:
+
+        child.matrix = parent_bone.matrix @ Rx(90) @ matrix_exp @ Rx(-90)
+
+    Because bakeTransformMatrix distributes over products and Rx(90)/Rx(-90)
+    cancel inside it, the exporter then emits exactly matrix_exp's translation
+    and rotation - the joint's original local transform. Processing parents
+    before children telescopes multi-level chains (the parent's own correction
+    cancels). Verified by HW180V9 round-trip."""
+    import bpy as _bpy
+    import json as _json
+    from mathutils import Matrix as _Mat
+    _Rx90 = _Mat.Rotation(math.radians(90), 4, 'X')
+    _Rxm90 = _Mat.Rotation(math.radians(-90), 4, 'X')
+
+    for arm_obj in [o for o in import_collection.objects if o.type == 'ARMATURE']:
+        raw = arm_obj.get('_i3d_chainfix')
+        if not raw:
+            continue
+        try:
+            plan = _json.loads(raw)
+        except Exception:
+            del arm_obj['_i3d_chainfix']
+            continue
+        # child bone name -> (parent bone name, matrix_exp)
+        entry = {cbn: (pbn, _Mat([m[0:4], m[4:8], m[8:12], m[12:16]]))
+                 for cbn, pbn, m in plan}
+        # parent-before-child order
+        ordered, placed, rem = [], set(), list(entry)
+        while rem:
+            progress = False
+            for cbn in list(rem):
+                pbn = entry[cbn][0]
+                if pbn not in entry or pbn in placed:
+                    ordered.append(cbn); placed.add(cbn); rem.remove(cbn)
+                    progress = True
+            if not progress:
+                ordered.extend(rem)  # cycle guard - should not happen
+                break
+        prev_active = _bpy.context.view_layer.objects.active
+        _bpy.context.view_layer.objects.active = arm_obj
+        _bpy.ops.object.mode_set(mode='EDIT')
+        try:
+            ad = arm_obj.data
+            for cbn in ordered:
+                pbn, mexp = entry[cbn]
+                if cbn == pbn:
+                    continue
+                ceb = ad.edit_bones.get(cbn)
+                peb = ad.edit_bones.get(pbn)
+                if ceb is None or peb is None:
+                    continue
+                newm = peb.matrix @ _Rx90 @ mexp @ _Rxm90
+                # A NaN/inf in an edit-bone matrix crashes Blender natively, so
+                # validate before assigning - a joint with a degenerate or
+                # zero-scale transform can produce one.
+                if not all(math.isfinite(c) for r in newm for c in r):
+                    report('WARNING',
+                           f"chained skin joint {cbn!r}: non-finite bone matrix "
+                           f"- left unparented")
+                    continue
+                # Refuse cyclic parenting (would also crash Blender).
+                _anc, _cyclic = peb, False
+                while _anc is not None:
+                    if _anc == ceb:
+                        _cyclic = True
+                        break
+                    _anc = _anc.parent
+                if _cyclic:
+                    continue
+                ceb.use_connect = False
+                ceb.parent = peb
+                ceb.matrix = newm
+        finally:
+            _bpy.ops.object.mode_set(mode='OBJECT')
+        if prev_active is not None:
+            try:
+                _bpy.context.view_layer.objects.active = prev_active
+            except Exception:
+                pass
+        del arm_obj['_i3d_chainfix']
+        report('INFO',
+               f"{arm_obj.name}: re-parented {len(ordered)} chained skin joint(s)")
+
+
 def _finalize_skin_childof(import_collection, report):
     """Set the proper Child-Of inverse on skin-wrapper bones and unmute them,
     AFTER _apply_axis_correction has baked X+90 into the armature's bone rest
@@ -2564,7 +2751,7 @@ def _process_skin_weights(import_collection, shape_map, shape_id_to_obj, report)
     interaction) must be verified in a re-export / in-game test.
     """
     import bpy as _bpy
-    from mathutils import Vector as _Vec, Matrix as _Mat
+    from mathutils import Vector as _Vec, Matrix as _Mat, Euler as _Eul
 
     # Flush pending transforms so source_obj.matrix_world is up to date.
     _bpy.context.view_layer.update()
@@ -2630,6 +2817,19 @@ def _process_skin_weights(import_collection, shape_map, shape_id_to_obj, report)
                f"skin-weights: bind nodes not found: {missing} - "
                f"those slots get a placeholder bone at origin")
 
+    # Detect joint CHAINS: a bind joint whose original parent is itself a bind
+    # joint (HW180V9 has 22). These must be re-created via bone PARENTING, not a
+    # Child-Of to the parent joint Empty - the Giants exporter parents a bone to
+    # its parent bone when boneHasParentBone is true (i3d_export.py:1523), and it
+    # ignores the Child-Of bone subtarget, so a Child-Of-to-bone would be lost.
+    obj_to_nid = {info['src']: nid for nid, info in joint_info.items()
+                  if info and info['src'] is not None}
+    chained_parent_nid = {}   # child joint nid -> parent joint nid
+    for _nid, _info in joint_info.items():
+        _pnid = obj_to_nid.get(_info['parent'])
+        if _pnid is not None:
+            chained_parent_nid[_nid] = _pnid
+
     orig_active = _bpy.context.view_layer.objects.active
 
     # ---- Build ONE shared armature at the scene root ----
@@ -2686,6 +2886,53 @@ def _process_skin_weights(import_collection, shape_map, shape_id_to_obj, report)
                 bone.head = head_local
                 bone.tail = bone.head + y_axis * 0.1
                 bone.align_roll(z_axis)
+
+        # Joint chains (a bind joint parented to another bind joint, e.g.
+        # HW180V9 has 22): the Giants exporter re-creates a chain only via real
+        # bone PARENTING (boneHasParentBone, i3d_export.py:1523), and it then
+        # computes the child RELATIVE TO THE PARENT BONE. The correct bone rest
+        # therefore depends on the parent bone matrix AFTER the X+90 axis
+        # correction that runs later, so we cannot set it here. Instead stash
+        # each chained joint's invariant local transform (relative to its parent
+        # joint) NOW, while the joint Empties still exist, and apply the
+        # parenting + reverse-engineered rest in _finalize_skin_chains() after
+        # axis correction. matrix_exp = src.matrix_local @ Rx(90) is the matrix
+        # the exporter must end up computing for this node (the post-pass sets
+        # child.matrix = parent_bone.matrix @ Rx(90) @ matrix_exp @ Rx(-90),
+        # which makes the exporter emit the original local translation/rotation;
+        # verified by round-trip on HW180V9).
+        _chainfix = []
+        for _nid, _pnid in chained_parent_nid.items():
+            _cbn = bone_name_of.get(_nid)
+            _pbn = bone_name_of.get(_pnid)
+            _info = joint_info.get(_nid)
+            _src = _info['src'] if _info else None
+            if not _cbn or not _pbn or _src is None:
+                continue
+            # matrix_exp must be the matrix the exporter ends up decomposing.
+            # The exporter does to_euler('XYZ') then subtracts 90 from the X
+            # euler, so we need to_euler(matrix_exp) == (rxml.x + 90, y, z).
+            # A plain `matrix_local @ Rx(90)` is WRONG at gimbal lock (|Y|==90):
+            # Blender 'XYZ' euler is Rz@Ry@Rx, so a left/right Rx(90) does not
+            # simply add 90 to the X euler there. Build it from the euler so it
+            # is exact even at |Y|==90 (verified on HW180V9's +/-90deg joints).
+            # Recover the raw Y-up XML rotation: the joint TG was imported with
+            # rot = M @ R_xml @ M^-1 (M = Rx(90)); undo the conjugation.
+            _M3 = _Mat.Rotation(math.radians(90), 3, 'X')
+            _rxml = (_M3.inverted() @ _src.matrix_local.to_3x3() @ _M3).to_euler('XYZ')
+            _mexp = (_Mat.Translation(_src.matrix_local.to_translation())
+                     @ _Eul((_rxml.x + math.radians(90), _rxml.y, _rxml.z),
+                            'XYZ').to_matrix().to_4x4())
+            if not all(math.isfinite(_c) for _row in _mexp for _c in _row):
+                # Degenerate joint transform -> would crash on bone.matrix set.
+                report('WARNING',
+                       f"skin joint {_cbn!r}: degenerate local transform - "
+                       f"chain re-parenting skipped")
+                continue
+            _chainfix.append([_cbn, _pbn, [c for _row in _mexp for c in _row]])
+        if _chainfix:
+            import json as _json
+            arm_obj['_i3d_chainfix'] = _json.dumps(_chainfix)
     finally:
         _bpy.ops.object.mode_set(mode='OBJECT')
 
@@ -2700,6 +2947,8 @@ def _process_skin_weights(import_collection, shape_map, shape_id_to_obj, report)
         info = joint_info.get(nid)
         if not info or info['parent'] is None:
             continue
+        if nid in chained_parent_nid:
+            continue  # parented via bone hierarchy (chain), not Child-Of
         pb = arm_obj.pose.bones.get(bone_name_of[nid])
         if pb is None:
             continue
@@ -2778,19 +3027,48 @@ def _process_skin_weights(import_collection, shape_map, shape_id_to_obj, report)
                f"({len(vg_map)} bone(s), {weight_count} weight(s))")
 
     # ---- Remove the now-duplicate source joint Empties ----
+    # Joint Empties can be parented to OTHER bind joints (joint chains, e.g.
+    # HW180V9 has 22 of them). We must NOT reparent a child onto a captured
+    # joint.parent that is itself a joint scheduled for removal: if that parent
+    # joint is removed first, the reference goes stale and `child.parent =
+    # <removed>` raises "StructRNA of type Object has been removed", aborting
+    # the whole import before axis correction runs (#29 - the mesh then stays
+    # Y-up / 90 deg off). So resolve every reparent target to the nearest
+    # ancestor that is NOT a joint being removed, and snapshot the full plan
+    # BEFORE deleting anything.
+    joint_objs = {info['src'] for info in joint_info.values()
+                  if info and info['src'] is not None}
+
+    def _surviving_ancestor(obj):
+        p = obj.parent
+        while p is not None and p in joint_objs:
+            p = p.parent
+        return p
+
+    # (child, target_parent, world_matrix). Only non-joint children need
+    # reparenting; child joints are removed in this same pass. Targets are
+    # non-joint survivors, so they never go stale during the removals below.
+    reparent_plan = []
+    for info in joint_info.values():
+        src = info['src'] if info else None
+        if src is None:
+            continue
+        target = _surviving_ancestor(src)
+        for child in src.children:
+            if child in joint_objs:
+                continue
+            reparent_plan.append((child, target, child.matrix_world.copy()))
+
+    for child, target, mw in reparent_plan:
+        child.parent = target
+        child.matrix_world = mw
+
     removed = 0
     for nid in unique_joint_ids:
         info = joint_info.get(nid)
         if not info or info['src'] is None:
             continue
         src = info['src']
-        parent = info['parent']
-        # Re-parent any children up to the joint's parent, keeping world
-        # transform (precea joints are leaves; this is defensive).
-        for child in list(src.children):
-            mw = child.matrix_world.copy()
-            child.parent = parent
-            child.matrix_world = mw
         try:
             _bpy.data.objects.remove(src, do_unlink=True)
             removed += 1
@@ -2912,13 +3190,21 @@ def _process_merge_groups(import_collection, shape_map, shape_id_to_obj, report)
 
         mg_counter += 1
         if mg_counter > 9:
-            report('ERROR',
-                   f"{root_obj.name}: more than 9 MergeGroups in this scene — "
-                   f"Giants exporter limits to 9. Re-export will lose excess groups.")
-            # Keep going so the user at least sees the geometry; the property won't
-            # be valid for re-export but the rest of the import succeeds.
+            # The Giants export PANEL caps the i3D_mergeGroup field at 9, but
+            # that is only a UI authoring limit: the exporter reads the raw
+            # custom property (I3DGetAttr -> obj[attr], no clamp) and the i3d
+            # format stores no merge-group number at all (just a Shape with
+            # skinBindNodeIds). Verified empirically: i3D_mergeGroup=10 exports
+            # to a valid .i3d/.i3d.shapes and loads fine in Giants Editor
+            # 10.0.12. So we keep the real group number and round-trip intact;
+            # the only caveat is the field can't be edited in the Giants panel.
+            report('WARNING',
+                   f"{root_obj.name}: MergeGroup #{mg_counter} is beyond the "
+                   f"Giants export panel's editable range (1-9). It re-exports "
+                   f"and loads in GE fine, but its Merge Group field can't be "
+                   f"edited in the Giants export panel.")
 
-        mg_num = min(mg_counter, 9)
+        mg_num = mg_counter
 
         # -------- Compute per-slot vertex / triangle index lists --------
         num_slots = len(bind_ids)

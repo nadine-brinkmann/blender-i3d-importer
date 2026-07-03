@@ -1,0 +1,12 @@
+--- i3d_ui.py	(original, io_export_i3d 9.1.0)
++++ i3d_ui.py	(patched - Blender 5.1: Panel __init__ must accept args)
+@@ -784,7 +784,8 @@
+     bl_category = "GIANTS I3D Exporter"
+ 
+ 
+-    def __init__(self):
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
+         global g_modalsRunning
+         self.filepath      = bpy.path.abspath(bpy.context.scene.I3D_UIexportSettings.I3D_exportFileLocation)
+         if not g_modalsRunning:

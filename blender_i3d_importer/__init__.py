@@ -12,7 +12,7 @@ Decodes the *.i3d.shapes binary directly in Python — no external tool needed.
 bl_info = {
     "name": "i3d Importer",
     "author": "Nadine Brinkmann",
-    "version": (0, 4, 0),
+    "version": (0, 4, 2),
     "blender": (5, 1, 0),
     "location": "File > Import > Farming Simulator i3d (.i3d)",
     "description": (
@@ -28,8 +28,10 @@ bl_info = {
 
 import bpy
 import os
+import json
+import re
 from bpy.props import (
-    BoolProperty, StringProperty, EnumProperty, FloatVectorProperty,
+    BoolProperty, StringProperty, EnumProperty, FloatVectorProperty, IntProperty,
 )
 from bpy.types import AddonPreferences, Operator
 from bpy_extras.io_utils import ImportHelper
@@ -42,6 +44,8 @@ if "importer" in locals():
     importlib.reload(i3d_attr_mapping)
     importlib.reload(i3d_shader_parser)
     importlib.reload(i3d_xml_parser)
+    importlib.reload(i3d_config_parser)
+    importlib.reload(i3d_config_preview)
     importlib.reload(i3d_shapes_reader)
     importlib.reload(i3d_shapes_models)
     importlib.reload(i3d_shapes_to_meshdata)
@@ -52,6 +56,8 @@ else:
     from . import i3d_attr_mapping
     from . import i3d_shader_parser
     from . import i3d_xml_parser
+    from . import i3d_config_parser
+    from . import i3d_config_preview
     from . import i3d_shapes_reader
     from . import i3d_shapes_models
     from . import i3d_shapes_to_meshdata
@@ -424,9 +430,31 @@ class FS25_OT_switch_materials(Operator):
         default='toggle',
     )
 
+    scope: bpy.props.EnumProperty(
+        name="Scope",
+        items=[
+            ('selection',    "Selection",    "Only selected mesh objects"),
+            ('all_imported', "All imported", "All mesh objects carrying i3d "
+                                             "materials, regardless of selection "
+                                             "or visibility"),
+        ],
+        default='selection',
+    )
+
     @classmethod
     def poll(cls, context):
-        return any(o.type == 'MESH' for o in context.selected_objects)
+        # Active whenever the scene contains any i3d mesh material. The
+        # 'Export (all)' button works scene-wide (scope='all_imported') and
+        # must not depend on selection; the Debug/Toggle buttons keep their
+        # selection requirement via layout.enabled in the N-Panel draw().
+        for obj in context.scene.objects:
+            if obj.type != 'MESH' or not obj.data:
+                continue
+            for slot in obj.material_slots:
+                m = slot.material
+                if m and m.get('_i3d_material_kind') in ('debug', 'export'):
+                    return True
+        return False
 
     def execute(self, context):
         # Lookup: (material_id, import_uuid, kind) -> material.
@@ -444,11 +472,21 @@ class FS25_OT_switch_materials(Operator):
             if mid is not None and kind in ('debug', 'export'):
                 lookup[(int(mid), imp_uuid, kind)] = m
 
+        # Object source depends on scope. 'all_imported' covers every mesh
+        # carrying an i3d material, regardless of selection or visibility -
+        # this is what the N-Panel 'Export (all)' button uses so no debug
+        # material can ever leak into a re-export via hidden helper objects
+        # (collision parts, shadowFocusBox, fill-root, component roots).
+        # slot.material assignment works on hidden objects without unhiding.
+        if self.scope == 'all_imported':
+            objects = [o for o in bpy.data.objects if o.type == 'MESH' and o.data]
+        else:
+            objects = [o for o in context.selected_objects
+                       if o.type == 'MESH' and o.data]
+
         swapped = 0
         skipped = 0
-        for obj in context.selected_objects:
-            if obj.type != 'MESH' or not obj.data:
-                continue
+        for obj in objects:
             for slot in obj.material_slots:
                 cur = slot.material
                 if cur is None:
@@ -457,7 +495,8 @@ class FS25_OT_switch_materials(Operator):
                 cur_kind = cur.get('_i3d_material_kind')
                 cur_uuid = cur.get('_i3d_import_uuid')
                 if mid is None or cur_kind not in ('debug', 'export'):
-                    skipped += 1
+                    # Non-i3d material: skip silently (no 'skipped' noise,
+                    # relevant in all_imported scope across the whole scene).
                     continue
                 # Determine target kind
                 if self.target_kind == 'toggle':
@@ -1353,6 +1392,101 @@ class FS25_OT_sync_debug_to_export_material(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class FS25_OT_load_config_xml(Operator, ImportHelper):
+    """Load i3dMappings from a vehicle/placeable config XML and assign them to
+    the imported objects (sets I3D_XMLconfigID + I3D_XMLconfigBool so the Giants
+    exporter can re-write the <i3dMappings> block on export). Scoped to the
+    import of the active object."""
+    bl_idname = "fs25.load_config_xml"
+    bl_label = "Load Config XML (i3dMappings)"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    filename_ext = ".xml"
+    filter_glob: StringProperty(default="*.xml", options={'HIDDEN'})
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return obj is not None and obj.get('_i3d_import_id') is not None
+
+    def execute(self, context):
+        import_id = context.active_object.get('_i3d_import_id')
+        mappings = i3d_xml_parser.parse_i3d_mappings(self.filepath)
+        if not mappings:
+            self.report({'WARNING'}, "No <i3dMappings> found in this XML.")
+            return {'CANCELLED'}
+        by_path = {}
+        for mid, npath in mappings:
+            by_path.setdefault(npath, mid)
+        path_index = {}
+        for obj in context.scene.objects:
+            if obj.get('_i3d_import_id') != import_id:
+                continue
+            p = obj.get('_i3d_node_path')
+            if p:
+                path_index.setdefault(p, []).append(obj)
+        applied = 0
+        unmatched = []
+        for npath, mid in by_path.items():
+            objs = path_index.get(npath)
+            if not objs:
+                unmatched.append(mid)
+                continue
+            for obj in objs:
+                obj['I3D_XMLconfigID'] = mid
+                obj['I3D_XMLconfigBool'] = True
+                applied += 1
+        # Convenience: also register this XML in the Giants exporter's "XML Config
+        # Files" list (scene I3D_UIexportSettings.i3D_updateXMLFilePath, joined as
+        # ';path;;'), so the user does not have to pick the file a second time for
+        # "Update XML". No-op when the exporter is not installed. Casing differs:
+        # FS25 10.0.x uses i3D_*, FS22 9.x uses I3D_*.
+        exporter_note = ""
+        settings = getattr(context.scene, "I3D_UIexportSettings", None)
+        if settings is not None:
+            attr = ("i3D_updateXMLFilePath" if hasattr(settings, "i3D_updateXMLFilePath")
+                    else "I3D_updateXMLFilePath" if hasattr(settings, "I3D_updateXMLFilePath")
+                    else None)
+            if attr is not None:
+                abspath = bpy.path.abspath(self.filepath)
+                current = getattr(settings, attr)
+                if abspath not in current:
+                    setattr(settings, attr, current + ";{};;".format(abspath))
+                    exporter_note = "; added to Giants exporter XML Config Files"
+
+        # Parse store configurations (designs, work areas, ...) for the in-Blender
+        # preview and stash them on the scene, keyed by import id. Applying the
+        # default option (index 0) reproduces the default store look.
+        try:
+            _cfg_types = i3d_config_parser.parse_configurations(self.filepath)
+            if _cfg_types:
+                _store = json.loads(context.scene.get('_i3d_storecfg', '{}'))
+                _types_d = i3d_config_parser.to_dict(_cfg_types)
+                _store[import_id] = {"types": _types_d,
+                                     "sel": {t["tag"]: 0 for t in _types_d}}
+                context.scene['_i3d_storecfg'] = json.dumps(_store)
+                _db = _fs25_data_base()
+                i3d_config_preview.capture_material_originals(import_id, _types_d)
+                for _t in _types_d:
+                    i3d_config_preview.apply_config(import_id, _t, 0, _db)
+        except Exception as _e:
+            self.report({'INFO'}, "Store-config preview not loaded: %r" % _e)
+
+        if unmatched:
+            # Nothing is silently lost: list the ids that found no matching object.
+            # Most commonly these target a skinned bone/joint, which is not assigned
+            # (bones are a rare i3dMapping target - see notes).
+            self.report(
+                {'WARNING'},
+                "%d i3dMapping(s) not assigned (no matching object - e.g. a "
+                "skinned bone/joint): %s" % (len(unmatched), ", ".join(unmatched)))
+        msg = f"Applied {applied} i3dMapping(s) to import '{import_id}' from {len(by_path)} entries"
+        if unmatched:
+            msg += f"; {len(unmatched)} not assigned (see warning)"
+        self.report({'INFO'}, msg + exporter_note + ".")
+        return {'FINISHED'}
+
+
 class FS25_PT_i3d_importer_panel(bpy.types.Panel):
     """N-Panel entry in the 3D Viewport sidebar with material-switch buttons."""
     bl_idname = "FS25_PT_i3d_importer_panel"
@@ -1367,17 +1501,46 @@ class FS25_PT_i3d_importer_panel(bpy.types.Panel):
         # Material switch section
         box = layout.box()
         box.label(text="Material Switch", icon='MATERIAL')
-        box.label(text="Affects selected meshes:")
+        box.label(text="Debug/Toggle: selected meshes")
+        box.label(text="Export (all): every imported object")
 
-        row = box.row(align=True)
+        # Debug + Toggle stay selection-scoped: greyed out without a mesh
+        # selection (unchanged limitation).
+        has_sel = any(o.type == 'MESH' for o in context.selected_objects)
+        col_sel = box.column(align=True)
+        col_sel.enabled = has_sel
+        row = col_sel.row(align=True)
         op_dbg = row.operator("fs25.switch_materials", text="Debug")
         op_dbg.target_kind = 'debug'
-        op_exp = row.operator("fs25.switch_materials", text="Export")
-        op_exp.target_kind = 'export'
-
-        row = box.row()
+        op_dbg.scope = 'selection'
         op_tog = row.operator("fs25.switch_materials", text="Toggle", icon='ARROW_LEFTRIGHT')
         op_tog.target_kind = 'toggle'
+        op_tog.scope = 'selection'
+
+        # Export (all): scene-wide, active whenever an import exists
+        # (independent of selection).
+        op_exp = box.operator("fs25.switch_materials", text="Export (all)")
+        op_exp.target_kind = 'export'
+        op_exp.scope = 'all_imported'
+
+        # i3dMappings: load a vehicle/placeable config XML and assign its
+        # <i3dMapping> ids to the imported objects (scoped to the active
+        # object's import). Greyed out until an imported object is active.
+        active = context.active_object
+        has_import = active is not None and active.get('_i3d_import_id') is not None
+        mbox = layout.box()
+        mbox.label(text="i3dMappings", icon='FILE_TEXT')
+        if has_import:
+            mbox.operator("fs25.load_config_xml", text="Load Config XML", icon='IMPORT')
+        else:
+            mbox.label(text="Select an imported object first", icon='INFO')
+
+        # Editable field for the active object's i3dMapping id, if assigned.
+        # The bracket path edits the IDProperty (dict) directly - the same
+        # storage the Giants exporter reads on export (obj["I3D_XMLconfigID"]),
+        # which the exporter's own RNA UI field fails to write in Blender 5.1+.
+        if active is not None and active.get('I3D_XMLconfigID') is not None:
+            mbox.prop(active, "i3d_importer_mapping_id", text="Mapping ID")
 
         # Community exporter round-trip section
         box = layout.box()
@@ -1748,6 +1911,120 @@ def _update_tree_season(self, context):
                 n.outputs[0].default_value = leaf_enable
 
 
+# --- Editable i3dMapping id proxy -------------------------------------------
+# The Giants exporter keeps the mapping id in TWO separate storages on Blender
+# 5.1+: the RNA property obj.I3D_XMLconfigID (shown in the exporter UI) and the
+# IDProperty obj["I3D_XMLconfigID"] (what the export actually reads). This proxy
+# writes BOTH, so our N-panel field stays in sync with the exporter field and
+# exports correctly with or without the exporter-side patch.
+def _i3d_mapping_id_get(self):
+    return self.get("I3D_XMLconfigID", "")
+
+
+def _i3d_mapping_id_set(self, value):
+    # The Giants exporter keeps this in two separate storages on Blender 5.1+,
+    # and its checkbox callback resets the id to the node name when toggled on.
+    # To get a custom id into the export reliably:
+    #   1) enable + set the RNA side first, so the exporter UI shows it (box on,
+    #      custom id) - setting the id AFTER the bool overrides the node-name reset;
+    #   2) always write the IDProperties the export actually reads, so it works
+    #      with or without the exporter patch and regardless of RNA/IDProp split.
+    try:
+        self.I3D_XMLconfigBool = True
+        self.I3D_XMLconfigID = value
+    except (AttributeError, TypeError):
+        pass                                  # exporter not installed - id-prop suffices
+    self["I3D_XMLconfigBool"] = 1
+    self["I3D_XMLconfigID"] = value
+
+
+def _fs25_data_base():
+    try:
+        return bpy.context.preferences.addons[__package__].preferences.fs25_data_base
+    except Exception:
+        return ""
+
+
+def _pretty_cfg_label(s):
+    """Make an l10n key or raw config label readable for the UI.
+
+    Base-game l10n keys (e.g. $l10n_configuration_valueUniversalShares) cannot be
+    resolved to their translation (the strings are not in the data files), so we
+    strip the key and split CamelCase: -> "Universal Shares".
+    """
+    if not s:
+        return "Option"
+    if s.startswith("$l10n_"):
+        s = s.split("value", 1)[1] if "value" in s else s.rsplit("_", 1)[-1]
+    s = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", s).strip()
+    return s or "Option"
+
+
+class FS25_OT_apply_store_config(Operator):
+    """Apply a store-configuration option to this import (visual preview only)."""
+    bl_idname = "fs25.apply_store_config"
+    bl_label = "Apply store config option"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    config_tag: StringProperty()
+    option_index: IntProperty()
+
+    def execute(self, context):
+        obj = context.active_object
+        import_id = obj.get('_i3d_import_id') if obj else None
+        if import_id is None:
+            self.report({'WARNING'}, "Select an imported object first.")
+            return {'CANCELLED'}
+        store = json.loads(context.scene.get('_i3d_storecfg', '{}'))
+        entry = store.get(import_id)
+        if not entry:
+            self.report({'WARNING'}, "No store config loaded for this import.")
+            return {'CANCELLED'}
+        ct = next((t for t in entry["types"] if t["tag"] == self.config_tag), None)
+        if ct is None:
+            return {'CANCELLED'}
+        entry["sel"][self.config_tag] = self.option_index
+        context.scene['_i3d_storecfg'] = json.dumps(store)
+        i3d_config_preview.apply_config(import_id, ct, self.option_index,
+                                       _fs25_data_base())
+        return {'FINISHED'}
+
+
+class FS25_PT_store_config(bpy.types.Panel):
+    """Store-configuration preview - switch design / work-area / etc. live."""
+    bl_idname = "FS25_PT_store_config"
+    bl_label = "Store Config (preview)"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "i3d Importer"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        obj = context.active_object
+        import_id = obj.get('_i3d_import_id') if obj else None
+        if import_id is None:
+            layout.label(text="Select an imported object", icon='INFO')
+            return
+        store = json.loads(context.scene.get('_i3d_storecfg', '{}'))
+        entry = store.get(import_id)
+        if not entry or not entry.get("types"):
+            layout.label(text="No store configurations loaded", icon='INFO')
+            layout.label(text="Use i3dMappings > Load Config XML")
+            return
+        for t in entry["types"]:
+            box = layout.box()
+            box.label(text=_pretty_cfg_label(t["name"]))
+            sel = entry["sel"].get(t["tag"], 0)
+            col = box.column(align=True)
+            for i, opt in enumerate(t["options"]):
+                op = col.operator("fs25.apply_store_config",
+                                  text=_pretty_cfg_label(opt["label"]),
+                                  depress=(i == sel))
+                op.config_tag = t["tag"]
+                op.option_index = i
+
+
 def register():
     bpy.utils.register_class(FS25_OT_terrain_base_color_reset)
     bpy.utils.register_class(FS25I3DImporterPreferences)
@@ -1759,6 +2036,10 @@ def register():
     bpy.utils.register_class(FS25_OT_invisible_ge_show)
     bpy.utils.register_class(FS25_OT_invisible_ge_hide)
     bpy.utils.register_class(FS25_OT_sync_debug_to_export_material)
+    bpy.utils.register_class(FS25_OT_load_config_xml)
+    bpy.utils.register_class(FS25_OT_apply_store_config)
+    bpy.types.Object.i3d_importer_mapping_id = StringProperty(
+        name="Mapping ID", get=_i3d_mapping_id_get, set=_i3d_mapping_id_set)
     bpy.utils.register_class(FS25_PT_i3d_importer_panel)
     # Sub-panel order (top -> bottom in the N-Panel):
     #   1. FS25 Snow + Ice
@@ -1769,6 +2050,7 @@ def register():
     bpy.utils.register_class(FS25_PT_invisible_ge_objects)
     bpy.utils.register_class(FS25_PT_material_settings)
     bpy.utils.register_class(FS25_PT_debug_view)
+    bpy.utils.register_class(FS25_PT_store_config)
     bpy.types.Scene.fs25_debug_mode = EnumProperty(
         name="FS25 Debug Mode",
         description="Show the standard material, a mask, or vertex colors",
@@ -1807,11 +2089,15 @@ def unregister():
     del bpy.types.Scene.fs25_tree_season
     del bpy.types.Scene.fs25_debug_only_active
     del bpy.types.Scene.fs25_debug_mode
+    bpy.utils.unregister_class(FS25_PT_store_config)
     bpy.utils.unregister_class(FS25_PT_debug_view)
     bpy.utils.unregister_class(FS25_PT_material_settings)
     bpy.utils.unregister_class(FS25_PT_invisible_ge_objects)
     bpy.utils.unregister_class(FS25_PT_snow_heaps)
     bpy.utils.unregister_class(FS25_PT_i3d_importer_panel)
+    del bpy.types.Object.i3d_importer_mapping_id
+    bpy.utils.unregister_class(FS25_OT_load_config_xml)
+    bpy.utils.unregister_class(FS25_OT_apply_store_config)
     bpy.utils.unregister_class(FS25_OT_sync_debug_to_export_material)
     bpy.utils.unregister_class(FS25_OT_invisible_ge_hide)
     bpy.utils.unregister_class(FS25_OT_invisible_ge_show)
