@@ -637,6 +637,25 @@ class FS25_OT_prepare_for_community_exporter(Operator):
         except AttributeError:
             pass
 
+        # materialSlotName round-trip. The importer stores the per-subset slot
+        # name (decoded from the .i3d.shapes binary) as the mat['materialSlotName']
+        # IDProperty, which only the OFFICIAL Giants exporter reads. The community
+        # exporter instead derives <material materialSlotName="..."> from
+        # i3d_attributes.material_slot_name, gated on use_material_slot_name
+        # (material.py get_slot_name -> shape.py subsets_info['materialSlotName']),
+        # and use_material_slot_name defaults to False. Without mirroring it here
+        # the slot name is dropped on community re-export, so vehicle design/color
+        # configs that look up materials by slot name (e.g. Fendt Vario
+        # "Black Beauty", exhaust/grill design configs) break. Applies to plain
+        # color materials too, so it runs before the customShader skip below.
+        slot_name = mat.get('materialSlotName')
+        if slot_name:
+            try:
+                attrs.material_slot_name = str(slot_name)
+                attrs.use_material_slot_name = True
+            except AttributeError:
+                pass
+
         shader_path = mat.get('customShader')
         if not shader_path:
             # Plain material: BSDF Base Color / Normal already export via the
