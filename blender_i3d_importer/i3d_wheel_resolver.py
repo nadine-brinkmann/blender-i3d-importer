@@ -867,3 +867,99 @@ def resolve_wheels(vehicle_xml_path, data_dir, config_index=0, dim_col=0,
                     _asp.connector_simple = (_asp.connector_mode == "simple")
                 specs.append(_asp)
     return specs
+
+
+# ---------------------------------------------------------------------------
+# Crawler tracks (Raupenfahrwerke)
+# ---------------------------------------------------------------------------
+# A wheelConfiguration can carry a <crawlers> section instead of / next to
+# <wheels>. Each <crawler filename="....xml" linkNode=".." isLeft=".."/> points
+# at a crawler XML (NOT the i3d directly); that XML's <file name=".i3d"
+# leftNode="0|0" rightNode="0|1"/> names the actual track i3d plus which of its
+# two top-level nodes is the left resp. right side. MVP: linkNode form (Lexion);
+# the Jaguar's linkWheelNodes form is a follow-up.
+
+
+def _read_crawler_xml(data_dir, cr_xml_abs):
+    """Return (i3d_abs, left_path, right_path, rotating) from a crawler XML.
+
+    left/right paths use our ``_i3d_node_path`` form (e.g. "0|0" -> "0>0").
+    rotating is ``[(node_str, radius_float), ...]`` from ``<rotatingParts>``
+    (node kept raw, resolved against the shown side at load time).
+    """
+    try:
+        root = ET.parse(cr_xml_abs).getroot()
+    except (ET.ParseError, OSError):
+        return (None, None, None, [])
+    f = root.find("file")
+    if f is None:
+        return (None, None, None, [])
+    rotating = []
+    rp = root.find("rotatingParts")
+    if rp is not None:
+        for r in rp.findall("rotatingPart"):
+            node = r.get("node")
+            try:
+                radius = float(r.get("radius"))
+            except (TypeError, ValueError):
+                continue
+            if node:
+                rotating.append((node, radius))
+    return (_abs_data(data_dir, f.get("name")),
+            _fs_node_to_ours(f.get("leftNode")),
+            _fs_node_to_ours(f.get("rightNode")),
+            rotating)
+
+
+def parse_crawlers(vehicle_xml_path, data_dir, config_index=0):
+    """Crawler specs for the wheelConfiguration at *config_index*.
+
+    Returns [] when that config has no <crawlers> (wheel-only configs) so the
+    caller can no-op. Each spec::
+
+        {
+            "i3d":        absolute path to the crawler .i3d,
+            "link_node":  i3dMapping id the crawler mounts on (linkNode),
+            "is_left":    bool,
+            "show_path":  _i3d_node_path of the side to keep visible,
+            "hide_path":  _i3d_node_path of the side to hide,
+        }
+
+    MVP: only <crawler> entries that use the single ``linkNode`` attribute are
+    returned; ``linkWheelNodes`` entries (Jaguar) are skipped for now.
+    """
+    try:
+        root = ET.parse(vehicle_xml_path).getroot()
+    except (ET.ParseError, OSError):
+        return []
+    cfgs = root.find("wheels/wheelConfigurations")
+    if cfgs is None:
+        return []
+    configs = cfgs.findall("wheelConfiguration")
+    if not (0 <= config_index < len(configs)):
+        return []
+    crawlers_el = configs[config_index].find("crawlers")
+    if crawlers_el is None:
+        return []
+
+    specs = []
+    for cr in crawlers_el.findall("crawler"):
+        link = cr.get("linkNode")
+        cr_xml = _abs_data(data_dir, cr.get("filename"))
+        if not (link and cr_xml):
+            # No single linkNode (e.g. Jaguar linkWheelNodes) or missing XML.
+            continue
+        i3d, left_p, right_p, rotating = _read_crawler_xml(data_dir, cr_xml)
+        if not i3d:
+            continue
+        is_left = (cr.get("isLeft") == "true")
+        specs.append({
+            "i3d": i3d,
+            "stem": os.path.splitext(os.path.basename(i3d))[0],
+            "link_node": link,
+            "is_left": is_left,
+            "show_path": left_p if is_left else right_p,
+            "hide_path": right_p if is_left else left_p,
+            "rotating": rotating,
+        })
+    return specs

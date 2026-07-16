@@ -52,6 +52,8 @@ if "importer" in locals():
     importlib.reload(i3d_reference_loader)
     importlib.reload(i3d_wheel_resolver)
     importlib.reload(i3d_wheel_loader)
+    importlib.reload(i3d_crawler_path)
+    importlib.reload(i3d_crawler_loader)
     importlib.reload(i3d_shapes_reader)
     importlib.reload(i3d_shapes_models)
     importlib.reload(i3d_shapes_to_meshdata)
@@ -68,6 +70,8 @@ else:
     from . import i3d_reference_loader
     from . import i3d_wheel_resolver
     from . import i3d_wheel_loader
+    from . import i3d_crawler_path
+    from . import i3d_crawler_loader
     from . import i3d_shapes_reader
     from . import i3d_shapes_models
     from . import i3d_shapes_to_meshdata
@@ -1909,6 +1913,9 @@ def _reload_wheels(context, import_id, entry, config_index, dim_col=0):
     brand = entry.get("brand", {}).get("sel", 0)
     i3d_wheel_loader.load_all_wheels(xml, data_dir, import_id, config_index,
                                      brand_index=brand, dim_col=dim_col)
+    # Crawler tracks (Raupenfahrwerke) live in a parallel <crawlers> section
+    # of the same wheelConfiguration; no-op when the config has none.
+    i3d_crawler_loader.load_crawlers(xml, data_dir, import_id, config_index)
     rc = entry.get("rimcolor")
     if rc and rc.get("options"):
         sel = rc.get("sel", 0)
@@ -2609,3 +2616,4 @@ def unregister():
 
 if __name__ == "__main__":
     register()
+    
