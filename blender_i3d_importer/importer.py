@@ -557,7 +557,10 @@ def _collect_skinweight_excluded_ids(nodes, shape_map, excluded):
     connectionHoses nodeId 28 / skinBindNodeIds[0]=30). Such a merge group must
     stay prefixed, so keying off the binary flag avoids mis-excluding it."""
     for n in nodes:
-        sid = (n.raw_attrs or {}).get("shapeId")
+        # shapeId is a dedicated field on I3DSceneNode (the parser consumes it
+        # out of raw_attrs), so read n.shapeId - NOT n.raw_attrs["shapeId"],
+        # which is always None and silently disabled the whole exclusion (#13).
+        sid = n.shapeId
         if sid is not None:
             try:
                 shp = shape_map.get(int(sid))
