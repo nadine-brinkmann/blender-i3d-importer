@@ -1,0 +1,43 @@
+--- __init__.py (original, io_export_i3d_10_0_2)
++++ __init__.py (patched — mirror I3D_XMLconfig RNA -> IDProperty on Blender 5.1+)
+@@ -64,11 +64,27 @@
+ 
+     self.layout.menu( I3D_MT_Menu.bl_idname )
+ 
++def _mirror_xml_config_to_idprops(self):
++    # Patch FS25-i3d-Importer: on Blender 5.1+ the python-registered RNA property
++    # (I3D_XMLconfigID / I3D_XMLconfigBool, edited by this add-on's UI) and the
++    # same-named IDProperty are SEPARATE storages. The export/Update-XML path
++    # reads the IDProperty (dcc/dccBlender.py getXMLConfigID/getXMLConfigBool via
++    # obj["I3D_XMLconfigID"]), so an i3dMapping typed into the UI never reaches
++    # the XML unless the RNA value is mirrored into the IDProperty. Assigning an
++    # IDProperty (self["..."] = ...) does not re-trigger the RNA update callback,
++    # so this cannot recurse.
++    self["I3D_XMLconfigBool"] = 1 if self.I3D_XMLconfigBool else 0
++    self["I3D_XMLconfigID"] = self.I3D_XMLconfigID
++
+ def update_xml_config_id(self, context):
+     if self.I3D_XMLconfigBool:
+         self.I3D_XMLconfigID = getFormattedNodeName(self.name)
+     else:
+         self.I3D_XMLconfigID = ''
++    _mirror_xml_config_to_idprops(self)
++
++def update_xml_config_id_str(self, context):
++    _mirror_xml_config_to_idprops(self)
+ 
+ #-------------------------------------------------------------------------------
+ #   Register
+@@ -79,10 +95,10 @@
+     # in the same way as all the others...
+     bpy.types.Object.I3D_XMLconfigBool = bpy.props.BoolProperty(default=False,
+                                                                 update=update_xml_config_id)
+-    bpy.types.Object.I3D_XMLconfigID = bpy.props.StringProperty(default='')
++    bpy.types.Object.I3D_XMLconfigID = bpy.props.StringProperty(default='', update=update_xml_config_id_str)
+     bpy.types.EditBone.I3D_XMLconfigBool = bpy.props.BoolProperty(default=False,
+                                                                   update=update_xml_config_id)
+-    bpy.types.EditBone.I3D_XMLconfigID = bpy.props.StringProperty(default='')
++    bpy.types.EditBone.I3D_XMLconfigID = bpy.props.StringProperty(default='', update=update_xml_config_id_str)
+     i3d_ui.register()
+     bpy.utils.register_class( I3D_MT_Menu )
+     bpy.types.STATUSBAR_HT_header.prepend(draw_I3D_Menu)
