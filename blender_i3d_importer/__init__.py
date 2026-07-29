@@ -104,6 +104,28 @@ DEFAULT_TERRAIN_POC_LAYER_NAMES = "ASPHALT,GRASS,MUD,FOREST_LEAVES,FOREST_GRASS"
 MAX_TERRAIN_POC_LAYERS = 5
 
 
+def _normalized_data_base(path):
+    """Tolerate the common mistake of pointing the game-folder preference at
+    the 'data' subfolder instead of the game root (#47).
+
+    Returns (normalized_path, note). note is None when the path is fine,
+    otherwise a human-readable message: either the auto-correction that was
+    applied (path ended in a 'data' folder -> parent used) or a warning that
+    no 'data' subfolder was found ($data/ resolution will fail)."""
+    p = (path or "").rstrip("\\/")
+    if not p:
+        return path, None
+    if os.path.isdir(os.path.join(p, "data")):
+        return p, None                       # correct: game root
+    if (os.path.basename(p).lower() == "data"
+            and os.path.isdir(os.path.join(p, "shaders"))):
+        parent = os.path.dirname(p)          # user pointed at .../data
+        return parent, (f"FS25 game folder: {path!r} is the data subfolder - "
+                        f"using {parent!r} instead")
+    return p, (f"FS25 game folder: no 'data' subfolder found in {path!r} - "
+               f"$data/ textures and shader XMLs will not resolve")
+
+
 class FS25_OT_terrain_base_color_reset(Operator):
     """Reset the 'Terrain base color' preference back to the default
     (linear conversion of sRGB #343A1D)."""
@@ -128,11 +150,14 @@ class FS25I3DImporterPreferences(AddonPreferences):
     bl_idname = __package__
 
     fs25_data_base: StringProperty(
-        name="FS25 game data folder (required)",
-        description="Folder containing 'data/' — used for $data/-path resolution "
-                    "(textures, shader XMLs). Also written automatically into "
-                    "the Game Location Setting of the Giants i3d Exporter "
-                    "on every import for convenience.",
+        name="FS25 game folder (required)",
+        description="Your Farming Simulator 25 installation folder — the one "
+                    "that CONTAINS the 'data' subfolder, e.g. "
+                    "...\\steamapps\\common\\Farming Simulator 25. Do not "
+                    "select the data folder itself. Used for $data/-path "
+                    "resolution (textures, shader XMLs). Also written "
+                    "automatically into the Game Location Setting of the "
+                    "Giants i3d Exporter on every import for convenience.",
         subtype='DIR_PATH',
         default=DEFAULT_FS25_DATA_BASE,
     )
@@ -385,16 +410,16 @@ class IMPORT_OT_fs25_i3d(Operator, ImportHelper):
     def execute(self, context):
         prefs = context.preferences.addons[__package__].preferences
 
-        # Mandatory: FS25 game data folder must be set + exist.
+        # Mandatory: FS25 game folder must be set + exist.
         # Without it $data/-path resolution fails and the Giants exporter
         # is misconfigured (gameLocation = "\").
         data_base = prefs.fs25_data_base
         if not data_base or not os.path.isdir(data_base):
             def _draw_popup(self_, ctx_):
                 if not data_base:
-                    self_.layout.label(text="FS25 game data folder is not set.")
+                    self_.layout.label(text="FS25 game folder is not set.")
                 else:
-                    self_.layout.label(text="FS25 game data folder does not exist:")
+                    self_.layout.label(text="FS25 game folder does not exist:")
                     self_.layout.label(text=f"  {data_base}")
                 self_.layout.separator()
                 self_.layout.label(text="Please set it in the add-on preferences.")
@@ -408,8 +433,14 @@ class IMPORT_OT_fs25_i3d(Operator, ImportHelper):
             except Exception:
                 pass
             self.report({'ERROR'},
-                        "FS25 game data folder not configured - import cancelled")
+                        "FS25 game folder not configured - import cancelled")
             return {'CANCELLED'}
+
+        # Tolerate the .../data mistake and warn when the folder looks wrong (#47).
+        data_base, _db_note = _normalized_data_base(data_base)
+        if _db_note:
+            self.report({'WARNING'} if "not resolve" in _db_note else {'INFO'},
+                        _db_note)
 
         try:
             _before = set(bpy.data.objects)
@@ -434,7 +465,7 @@ class IMPORT_OT_fs25_i3d(Operator, ImportHelper):
                 terrain_lod=self.terrain_lod,
                 terrain_base_color=tuple(self.terrain_base_color),
                 terrain_poc_layer_names=self.terrain_poc_layer_names,
-                fs25_data_base=prefs.fs25_data_base,
+                fs25_data_base=data_base,
                 export_dir=prefs.export_dir,
                 snippets_blend_path=DEFAULT_SNIPPETS_BLEND_PATH,
             )
@@ -1692,7 +1723,8 @@ def _i3d_mapping_id_set(self, value):
 
 def _fs25_data_base():
     try:
-        return bpy.context.preferences.addons[__package__].preferences.fs25_data_base
+        raw = bpy.context.preferences.addons[__package__].preferences.fs25_data_base
+        return _normalized_data_base(raw)[0]   # silent .../data auto-correct (#47)
     except Exception:
         return ""
 

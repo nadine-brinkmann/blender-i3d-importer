@@ -113,7 +113,7 @@ modify, and (mostly) round-trip back into the Giants Editor through the Giants i
 
 1. `Edit` → `Preferences` → `Add-ons` → find **i3d Importer**.
 2. Expand its preferences. They are grouped in three sections:
-   - **Paths** — set **FS25 game data folder** to your FS25 installation root (the folder that contains the `data/` subfolder). Optionally set **Re-export output folder**.
+   - **Paths** — set **FS25 game folder** to your FS25 installation root, e.g. `...\steamapps\common\Farming Simulator 25` — the folder that *contains* the `data/` subfolder, **not** the `data` folder itself. Optionally set **Re-export output folder**.
    - **Import Defaults** — defaults for the per-import operator options (axis correction, auto-hide, debug materials, etc.).
    - **Terrain** — default LOD, base color for the terrain preview, and the comma-separated list of `<CombinedLayer>` names to load (up to 5; default covers ASPHALT, GRASS, MUD, FOREST_LEAVES, FOREST_GRASS).
 3. Check if you want to apply one or more of the *optional* Giants i3d Exporter [patches](blender_i3d_importer/patches/README.md). 
