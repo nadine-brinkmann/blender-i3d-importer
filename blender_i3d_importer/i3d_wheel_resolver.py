@@ -97,10 +97,12 @@ def _abs_existing(data_dir, rel):
 
 
 def _fs_node_to_ours(p):
-    """FS index path (e.g. "1|0") -> our _i3d_node_path ("1>0"): first | -> >."""
+    """FS index path -> our ``_i3d_node_path``. "1|0" -> "1>0" (first | -> >);
+    a bare root index "0" -> "0>" (a whole scene root, e.g. a symmetric crawler
+    whose left and right sides are the same node)."""
     if not p:
         return None
-    return p.replace("|", ">", 1)
+    return p.replace("|", ">", 1) if "|" in p else (p + ">")
 
 
 def _abs_data(data_dir, dollar_path):
@@ -925,8 +927,8 @@ def parse_crawlers(vehicle_xml_path, data_dir, config_index=0):
             "hide_path":  _i3d_node_path of the side to hide,
         }
 
-    MVP: only <crawler> entries that use the single ``linkNode`` attribute are
-    returned; ``linkWheelNodes`` entries (Jaguar) are skipped for now.
+    Both mount forms are returned: a single ``linkNode`` empty (Lexion) or a
+    ``linkWheelNodes`` list of wheel ids the crawler aligns to (Jaguar).
     """
     try:
         root = ET.parse(vehicle_xml_path).getroot()
@@ -945,21 +947,36 @@ def parse_crawlers(vehicle_xml_path, data_dir, config_index=0):
     specs = []
     for cr in crawlers_el.findall("crawler"):
         link = cr.get("linkNode")
+        link_wheels = (cr.get("linkWheelNodes") or "").split()
         cr_xml = _abs_data(data_dir, cr.get("filename"))
-        if not (link and cr_xml):
-            # No single linkNode (e.g. Jaguar linkWheelNodes) or missing XML.
+        if not (cr_xml and (link or link_wheels)):
             continue
         i3d, left_p, right_p, rotating = _read_crawler_xml(data_dir, cr_xml)
         if not i3d:
             continue
         is_left = (cr.get("isLeft") == "true")
+        off = cr.get("offset")
+        offset = None
+        if off:
+            try:
+                offset = tuple(float(x) for x in off.split())
+            except ValueError:
+                offset = None
+        tw = cr.get("trackWidth")
+        try:
+            track_width = float(tw) if tw else None
+        except ValueError:
+            track_width = None
         specs.append({
             "i3d": i3d,
             "stem": os.path.splitext(os.path.basename(i3d))[0],
-            "link_node": link,
+            "link_node": link,             # single mount empty (Lexion) or None
+            "link_wheels": link_wheels,    # wheel i3dMapping ids (Jaguar) or []
             "is_left": is_left,
             "show_path": left_p if is_left else right_p,
             "hide_path": right_p if is_left else left_p,
             "rotating": rotating,
+            "offset": offset,              # FS <crawler offset="x y z"> or None
+            "track_width": track_width,    # FS <crawler trackWidth=..> or None
         })
     return specs

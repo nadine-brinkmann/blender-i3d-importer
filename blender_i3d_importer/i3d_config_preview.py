@@ -864,7 +864,10 @@ def _rim_materials(import_id):
     seen = set()
     out = []
     for o in bpy.data.objects:
-        if o.get("_i3d_wheel_import") != import_id:
+        # Wheel parts AND crawler parts: the crawler's drive-wheel rims carry a
+        # 'rim_inner_mat' shapes slot, which the game's rim-colour pass follows.
+        if (o.get("_i3d_wheel_import") != import_id
+                and o.get("_i3d_crawler_import") != import_id):
             continue
         for ms in o.material_slots:
             m = debug_pair(ms.material)      # slot may hold the export material
