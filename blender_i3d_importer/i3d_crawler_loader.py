@@ -16,6 +16,15 @@ reproduce the wrap geometrically: build the rubber-band outline around the
 crawler's rotating wheels (:mod:`i3d_crawler_path`) and bend the strip's
 vertices onto it (all in the crawler-root-local frame).
 
+Forestry boggie tracks (Olofsfors, e.g. the John Deere harvester1270G) are a
+third form: NO ``<rotatingParts>`` and no wheels of their own - the belt runs
+around the two vehicle wheels named by ``linkWheelNodes``, and the band is not
+one strip but a chain of small origin-stacked segments the ``motionPath``
+shader distributes along a baked path (trackArray texture). We place the root
+the way ``Crawlers.lua`` does (back link wheel plus LOCAL ``offset`` toward the
+front wheel) and distribute the segments along the belt outline, seating the
+tread plates' inner face on the measured tire radius.
+
 Reuses the wheel loader's helpers (``_drive_object_map``, ``_link``,
 ``_dup_subtree``, ``_tag_tree``) and ``i3d_reference_loader``. No ``bpy.ops`` /
 menu calls, so this is independent of Blender's UI language.
@@ -37,6 +46,11 @@ _CRAWLER_TAG = "_i3d_crawler_import"
 # A track band strip is the long flat 10 m mesh; anything shorter (wheels,
 # decals, mounts) is not a strip. Metres.
 _STRIP_MIN_Y = 5.0
+
+# A segmented band (forestry tracks) shows up as one parent with many small
+# origin-stacked mesh children (ecoTrack: 66). Fewer siblings than this is not
+# a chain.
+_SEGMENT_MIN_COUNT = 8
 
 
 def _descendants(root):
@@ -98,6 +112,34 @@ def _hide_root_for_path(roots, node_path):
 def _mesh_y_extent(obj):
     ys = [v.co.y for v in obj.data.vertices]
     return (max(ys) - min(ys)) if ys else 0.0
+
+
+def _mesh_z_extent(obj):
+    zs = [v.co.z for v in obj.data.vertices]
+    return (max(zs) - min(zs)) if zs else 0.0
+
+
+def _tire_ref(link_obj):
+    """(world centre, radius) of the visual tire below a wheel link node, or
+    ``(None, 0.0)``. The tire is the biggest visible wheel mesh below the node
+    (rims are smaller; mud/far LODs are flagged GE-invisible and skipped).
+
+    The CENTRE matters, not just the radius: the game moves the crawler
+    linkNode onto the wheel's first visual tire node on the first update
+    ('we might have a rimOffset', Crawlers.lua) - on the harvester1270G the
+    tire sits rimOffset ~0.22 outboard of the repr node, and the band is
+    centred on the tire, not on the link node (verified visually)."""
+    best, best_d = None, 0.0
+    for o in _descendants(link_obj):
+        if (o.type == 'MESH' and o.data and not o.hide_viewport
+                and not o.get("_i3d_invisible_in_ge")
+                and o.get("_i3d_wheel_import")):
+            d = max(o.dimensions.y, o.dimensions.z)
+            if d > best_d:
+                best, best_d = o, d
+    if best is None:
+        return None, 0.0
+    return best.matrix_world.translation.copy(), best_d / 2.0
 
 
 def _owns_variant(strip, stem):
@@ -162,6 +204,31 @@ def _place_by_wheels(root, l_objs, rotating, show):
     return True
 
 
+def _place_at_link_wheels(root, l_objs, spec):
+    """Game placement for crawlers WITHOUT ``<rotatingParts>`` (forestry boggie
+    tracks). Crawlers.lua parents the crawler to a ``crawlerLinkNode`` created
+    at the BACK link wheel (``linkWheelNodes[1]``), oriented toward the front
+    one, then applies ``<crawler offset>`` via ``setTranslation`` - a LOCAL
+    translation: FS x = lateral, y = up, z = toward the front wheel (the
+    harvester1270G's ``0 0 0.707`` is half its 1.414 m boggie wheelbase, i.e.
+    the root lands midway between the wheels). Translation only - the vehicle
+    is imported axis-aligned and the wrap measures the wheels root-locally."""
+    back = _tire_ref(l_objs[0])[0] or l_objs[0].matrix_world.translation.copy()
+    front = _tire_ref(l_objs[1])[0] or l_objs[1].matrix_world.translation.copy()
+    d = front - back
+    fwd = d.normalized() if d.length > 1e-9 else Vector((0.0, -1.0, 0.0))
+    origin = back
+    off = spec.get("offset")
+    if off and len(off) >= 3:
+        up = Vector((0.0, 0.0, 1.0))
+        # FS X = up x forward maps to Blender up.cross(fwd) (both axes are
+        # converted by the same Y-up -> Z-up mapping). Only z is exercised by
+        # vanilla data; x/y kept for completeness.
+        origin = back + up.cross(fwd) * off[0] + up * off[1] + fwd * off[2]
+    root.matrix_world = (Matrix.Translation(origin - root.matrix_world.translation)
+                         @ root.matrix_world)
+
+
 def _place_crawler(root, spec, links, report=None):
     """Seat the imported crawler *root* on the vehicle. Returns True on success.
 
@@ -169,6 +236,8 @@ def _place_crawler(root, spec, links, report=None):
     vehicle wheel nodes) when present - some crawlers (xerion) also carry a
     ``linkNode`` that is only the movement parent, not the visual anchor. Falls
     back to snapping the root onto the ``linkNode`` mount empty (Lexion, mach4R).
+    Without ``<rotatingParts>`` (forestry tracks) the root is seated at the back
+    link wheel plus the local XML offset, exactly like the game does.
     """
     show = spec.get("show_path")
     link_wheels = spec.get("link_wheels") or []
@@ -179,6 +248,16 @@ def _place_crawler(root, spec, links, report=None):
         if all(l_objs) and _place_by_wheels(root, l_objs, rotating, show):
             _apply_offset(root, spec)
             return True
+
+    if len(link_wheels) >= 2 and not rotating:
+        l_objs = [links.get(x) for x in link_wheels[:2]]
+        if all(l_objs):
+            _place_at_link_wheels(root, l_objs, spec)
+            return True
+        if report is not None:
+            report("WARNING", "Crawler link wheels %r not found"
+                   % (link_wheels[:2],))
+        return False
 
     link_node = spec.get("link_node")
     if link_node:
@@ -248,17 +327,130 @@ def _deform_strip(strip, root, pts, cum, length, track_width=1.0):
     strip["_i3d_crawler_wrapped"] = True
 
 
-def _wrap_crawler(root, spec, report=None):
+def _distribute_segments(parts, root, pts, cum, length, track_width=1.0):
+    """Place the origin-stacked chain segments of a forestry track along the
+    belt outline (crawler-root-local frame, X = width, wrap plane = Y-Z).
+
+    The chain alternates full-width tread plates (one interleaved half of the
+    slots) and connecting links sitting half a pitch further along. Each part
+    keeps its own geometry and is moved rigidly: local +Y follows the belt
+    tangent, local +Z the outward normal; the plates' inner face (their min z,
+    the sheet that rides on the tire) is seated on the wheel radius. In-game
+    the motionPath shader does exactly this from the baked trackArray texture.
+
+    *track_width* scales the part width (local X), matching the strip case."""
+    parts = sorted(parts, key=lambda o: o.name)
+    n = len(parts)
+    paired = n >= 4 and n % 2 == 0
+    plates = parts
+    if paired:
+        even, odd = parts[0::2], parts[1::2]
+
+        def _med_z(group):
+            es = sorted(_mesh_z_extent(o) for o in group)
+            return es[len(es) // 2]
+
+        # the plates are the flat group (small z extent); the links carry the
+        # tall guide lugs
+        plates = even if _med_z(even) <= _med_z(odd) else odd
+    zb = -min(min((v.co.z for v in o.data.vertices), default=0.0)
+              for o in plates)
+    n_pitch = n // 2 if paired else n
+    for i, o in enumerate(parts):
+        k = i // 2 if paired else i
+        half = 0.5 if (paired and i % 2 == 1) else 0.0
+        s = (k + half) / n_pitch
+        (a, b), (ta, tb) = i3d_crawler_path.sample(pts, cum, length, s * length)
+        na, nb = tb, -ta                    # CCW outward normal in the wrap plane
+        # Segment orientation settled EMPIRICALLY on the harvester1270G
+        # (Olofsfors tracks, all four boggies confirmed visually): relative to
+        # the naive (width, tangent, outward) frame - which MIRRORS the
+        # segments (det -1, their outside facing inside) - the width axis and
+        # the tangent and the radial axis are all negated, keeping the seat
+        # position. det +1, plates ride on the tire, the tall tread bars
+        # point outward.
+        m = Matrix(((-track_width, 0.0, 0.0, 0.0),
+                    (0.0, -ta, -na, a + na * zb),
+                    (0.0, -tb, -nb, b + nb * zb),
+                    (0.0, 0.0, 0.0, 1.0)))
+        o.matrix_world = root.matrix_world @ m
+        o["_i3d_crawler_wrapped"] = True
+
+
+def _wrap_from_link_wheels(root, spec, links, report=None):
+    """Wrap for crawlers WITHOUT ``<rotatingParts>`` (forestry boggie tracks):
+    the belt circles the two vehicle link wheels. Wheel centres come from the
+    link objects, the radius from the loaded tire meshes below them (crawler
+    configs override the physics radius with band thickness included, so the
+    visual mesh - not the config value - is the right source)."""
+    show = spec.get("show_path")
+    link_wheels = spec.get("link_wheels") or []
+    if not show or len(link_wheels) < 2:
+        return
+    l_objs = [links.get(x) for x in link_wheels[:2]]
+    if not all(l_objs):
+        return
+    refs = [_tire_ref(o) for o in l_objs]
+    radius = max((r for _c, r in refs), default=0.0)
+    if radius <= 0.0:
+        if report is not None:
+            report("WARNING", "Crawler %s: no tire mesh found to measure the "
+                   "wheel radius, band left flat" % show)
+        return
+    inv = root.matrix_world.inverted()
+    centres = [c if c is not None else o.matrix_world.translation.copy()
+               for (c, _r), o in zip(refs, l_objs)]
+    wheels = [((inv @ c).y, (inv @ c).z, radius) for c in centres]
+    pts, cum, length = i3d_crawler_path.build_belt_path(wheels)
+    if length <= 0.0:
+        return
+
+    prefix = show if show.endswith(">") else show + "|"
+
+    def _in_show(o):
+        # merged-children parts carry no node path of their own - walk up to
+        # the nearest ancestor that does
+        while o is not None:
+            p = o.get("_i3d_node_path")
+            if p is not None:
+                return p == show or p.startswith(prefix)
+            o = o.parent
+        return False
+
+    groups = {}
+    for o in _descendants(root):
+        if (o.type == 'MESH' and o.data and not o.hide_viewport
+                and not o.get("_i3d_invisible_in_ge")   # hide_set() far LODs
+                and _in_show(o) and _mesh_y_extent(o) < _STRIP_MIN_Y
+                and o.parent is not None):
+            groups.setdefault(o.parent, []).append(o)
+    seg_sets = [v for v in groups.values() if len(v) >= _SEGMENT_MIN_COUNT]
+    if not seg_sets:
+        if report is not None:
+            report("WARNING", "Crawler %s: no band segments found to wrap"
+                   % show)
+        return
+    track_width = spec.get("track_width") or 1.0
+    for parts in seg_sets:
+        _distribute_segments(parts, root, pts, cum, length, track_width)
+
+
+def _wrap_crawler(root, spec, links=None, report=None):
     """Wrap the shown track band of *root* around its wheels; hide any foreign
-    variant band. No-op when the spec lacks rotating-wheel data."""
+    variant band. Crawlers with ``<rotatingParts>`` bend their strip around the
+    crawler's own wheels; without them (forestry tracks) the segments are
+    distributed around the vehicle's link wheels."""
     show = spec.get("show_path")
     rotating = spec.get("rotating") or []
-    stem = spec.get("stem") or ""
-    if not (show and rotating):
+    if not show:
+        return
+    if not rotating:
+        _wrap_from_link_wheels(root, spec, links or {}, report=report)
         return
 
     desc = _descendants(root)
     by_path = {o.get("_i3d_node_path"): o for o in desc}
+    stem = spec.get("stem") or ""
 
     # Rotating wheels in the crawler-root-local wrap plane (Y=fore/aft, Z=up).
     inv = root.matrix_world.inverted()
@@ -383,9 +575,12 @@ def load_crawlers(vehicle_xml_path, data_dir, import_id, config_index=0,
         i3d_wheel_loader._hide_lod_and_mud(root)
 
         # Hide the opposite side - unless it is the same node (symmetric track,
-        # leftNode == rightNode), where the whole subtree is shown for both.
+        # leftNode == rightNode) or a DIFFERENT scene root (left/right as
+        # separate roots, e.g. Olofsfors EX/KovaX: the other root was never
+        # instantiated, so there is nothing to hide).
         hp = spec.get("hide_path")
-        if hp and hp != show:
+        hide_key = hp[:hp.index(">") + 1] if hp and ">" in hp else None
+        if hp and hp != show and hide_key == root_key:
             hide_root = _hide_root_for_path([root], hp)
             if hide_root is not None:
                 _hide_subtree(hide_root)
@@ -408,7 +603,7 @@ def load_crawlers(vehicle_xml_path, data_dir, import_id, config_index=0,
         bpy.context.view_layer.update()
         for root, spec in to_wrap:
             try:
-                _wrap_crawler(root, spec, report=report)
+                _wrap_crawler(root, spec, links=links, report=report)
             except Exception as exc:          # never let wrap break the load
                 if report is not None:
                     report("WARNING", "Crawler wrap failed: %r" % exc)
