@@ -805,8 +805,12 @@ def _apply_config_xml(context, import_id, filepath, report):
             unmatched.append((mid, npath))
             continue
         for obj in objs:
-            obj['I3D_XMLconfigID'] = mid
-            obj['I3D_XMLconfigBool'] = True
+            # Route through the i3d_importer_mapping_id proxy so BOTH storages
+            # are written: the IDProperty the export reads AND the RNA property
+            # the Giants exporter UI shows. Setting only obj["I3D_XMLconfigID"]
+            # (IDProperty) left the exporter's N-panel field blank on Blender
+            # 5.1+, where RNA and IDProperty are separate storages.
+            obj.i3d_importer_mapping_id = mid
             applied += 1
     exporter_note = ""
     settings = getattr(context.scene, "I3D_UIexportSettings", None)

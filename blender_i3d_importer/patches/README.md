@@ -12,6 +12,7 @@ an imported `.i3d` through the official Giants i3d Exporter
 | `01-giants-exporter-referenceChildPath-keyerror.patch` | `KeyError: 'i3D_referenceChildPath'` during re-export | When the i3d contains ReferenceNodes (most vehicles, many buildings) |
 | `02-giants-exporter-emissive-color-default.patch` | Every material gets `emissiveColor="1 1 1 1"` in the re-exported i3d | Recommended for all round-trip workflows |
 | `03-giants-exporter-mergegroup-nobindpose.patch` | Re-exported MergeGroups end up in root space (FS22-style) → child positions shift on re-import, GE's *dissolve merge group* corrupts mesh/normals/UVs | Recommended for all round-trip workflows that touch MergeGroups |
+| `04-giants-exporter-xmlconfig-rna-idprop-mirror.patch` | i3dMappings typed into the exporter's UI are **not** written to the config XML on *Update XML* (Blender 5.1+) | Recommended on Blender 5.1+ whenever you add/edit i3dMappings in the exporter UI |
 
 ## Where to find the Giants Exporter
 
@@ -233,6 +234,47 @@ Replace with:
 
 modelleicher in [#8](https://github.com/nadine-brinkmann/blender-i3d-importer/issues/8)
 for pointing out the `noBindPose` flag and the GE *dissolve* symptom.
+
+---
+
+## Patch 04 — i3dMapping UI edits not written on *Update XML* (Blender 5.1+)
+
+### Symptom
+
+On Blender 5.1+ you add or edit an i3dMapping directly in the Giants exporter
+UI (tick the box, type a *Node Id*), then run *Update XML*. The new/edited
+i3dMapping does **not** appear in the config XML. i3dMappings written by our
+importer's own N-panel field are unaffected (the importer writes both storages
+itself).
+
+### Cause
+
+Blender 5.1+ keeps a python-registered RNA property (`obj.I3D_XMLconfigID`,
+`obj.I3D_XMLconfigBool` — what the exporter's `layout.prop(...)` UI edits) and
+the same-named **IDProperty** (`obj["I3D_XMLconfigID"]` — what the export reads
+in `dcc/dccBlender.py` `getXMLConfigID` / `getXMLConfigBool`) in **separate
+storages**. The exporter's `update_xml_config_id` callback only ever writes the
+RNA side, so a value typed into the UI never reaches the IDProperty the export
+actually reads → it is silently skipped.
+
+### Fix — mirror RNA → IDProperty on every change
+
+**File:** `io_export_i3d_10_0_x/__init__.py`
+
+Add a mirror helper + a StringProperty update callback (right before
+`update_xml_config_id`), extend `update_xml_config_id` to call the mirror, and
+add `update=update_xml_config_id_str` to both `I3D_XMLconfigID` StringProperty
+registrations. See `04-giants-exporter-xmlconfig-rna-idprop-mirror.patch` for
+the exact hunks.
+
+After the patch, ticking the box / typing a Node Id in the exporter UI mirrors
+the value straight into the IDProperty, so *Update XML* (and a full re-export)
+picks it up. Assigning an IDProperty does not re-fire the RNA update callback,
+so the mirror cannot recurse.
+
+> **Note:** covers Object nodes. Bone i3dMappings are edited on `EditBone`
+> while the export reads `Bone` IDProperties — the same registration is patched
+> for `EditBone`, but the object case is the common one.
 
 ---
 
