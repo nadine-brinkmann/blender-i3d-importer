@@ -2183,6 +2183,10 @@ class FS25_OT_unload_wheels(Operator):
             entry.pop("brand", None)
             context.scene['_i3d_storecfg'] = json.dumps(store)
         n = i3d_wheel_loader.remove_wheels(import_id)
+        # Crawler tracks are loaded dynamically by the game too, so 'None' must
+        # strip them as well - otherwise a re-export would bake in the (wrapped)
+        # track band.
+        n_crawl = i3d_crawler_loader.remove_crawlers(import_id)
         i3d_wheel_loader._purge_empty_ref_collections()
         # Leave no residue: baked wheel meshes are now user-less, and their
         # pristine pre-bake datablocks are pinned only by our fake user
@@ -2203,8 +2207,9 @@ class FS25_OT_unload_wheels(Operator):
                     n_mesh += 1
             except Exception:
                 pass
-        self.report({'INFO'}, "Removed %d wheel part(s), purged %d mesh(es)."
-                    % (n, n_mesh))
+        self.report({'INFO'},
+                    "Removed %d wheel part(s), %d crawler object(s), purged "
+                    "%d mesh(es)." % (n, n_crawl, n_mesh))
         return {'FINISHED'}
 
 

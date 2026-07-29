@@ -157,15 +157,21 @@ def _wrap_crawler(root, spec, report=None):
         return
 
     prefix = show + "|"
-    for o in desc:
-        np_ = o.get("_i3d_node_path") or ""
-        if not np_.startswith(prefix):
-            continue
-        if o.type != 'MESH' or not o.data or o.hide_viewport:
-            continue                        # skip wheels/decals and hidden mud/LOD
-        if _mesh_y_extent(o) < _STRIP_MIN_Y:
-            continue                        # not the long track band
-        if _owns_variant(o, stem):
+    strips = [o for o in desc
+              if (o.get("_i3d_node_path") or "").startswith(prefix)
+              and o.type == 'MESH' and o.data and not o.hide_viewport
+              and _mesh_y_extent(o) >= _STRIP_MIN_Y]
+    if not strips:
+        return
+    # The stem split only matters when one i3d ships several band variants (the
+    # CLAAS TerraTrac i3d carries both a Lexion and a Jaguar band). With a single
+    # band - or if none matches the stem - wrap everything rather than risk
+    # hiding the only track.
+    own = [o for o in strips if _owns_variant(o, stem)]
+    if len(strips) == 1 or not own:
+        own = strips
+    for o in strips:
+        if o in own:
             _deform_strip(o, root, pts, cum, length)
         else:
             # Foreign variant sharing the i3d - hide it (flagged so 'Show All'
