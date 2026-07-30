@@ -1996,6 +1996,9 @@ def _build_material(material_id, scene, image_cache, shader_cache, i3d_dir, repo
             bsdf.inputs['Alpha'].default_value = rgba[3]
             mat.blend_method = 'BLEND'
 
+    # (alphaBlending -> blend_method='BLEND' is handled canonically in
+    # _apply_material_custom_properties below, upstream fix for #33.)
+
     # specularColor roundtrip. FS25 reads <Material specularColor> as
     # (smoothness, bakedAO, metalness) - baseShader.ogsfx getSpecular(). The
     # Giants Blender exporter writes it back as (1 - Roughness,
