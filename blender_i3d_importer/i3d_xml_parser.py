@@ -82,6 +82,36 @@ class I3DSceneNode:
 
 
 @dataclass
+class I3DAnimationKey:
+    time: float
+    translation: Optional[Tuple[float, float, float]] = None
+    rotation: Optional[Tuple[float, float, float]] = None
+    scale: Optional[Tuple[float, float, float]] = None
+    raw_attrs: Dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class I3DAnimationKeyframes:
+    node_id: int
+    keys: List[I3DAnimationKey] = field(default_factory=list)
+
+
+@dataclass
+class I3DAnimationClip:
+    name: str
+    duration: float = 0.0
+    keyframes: List[I3DAnimationKeyframes] = field(default_factory=list)
+    raw_attrs: Dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class I3DAnimationSet:
+    name: str
+    clips: List[I3DAnimationClip] = field(default_factory=list)
+    raw_attrs: Dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
 class I3DScene:
     """Parsed i3d file."""
     roots: List[I3DSceneNode] = field(default_factory=list)
@@ -103,6 +133,11 @@ class I3DScene:
     # type is one of: boolean, integer, float, string, scriptCallback.
     # value_str is the raw XML value; conversion happens in the importer.
 
+    external_anim_file: Optional[str] = None
+    animation_sets: List[I3DAnimationSet] = field(default_factory=list)
+    # Inline <Animation><AnimationSets> data, when the i3d is not split into
+    # a binary externalAnimFile.
+
 
 # ---------------------------------------------------------------------------
 # Parsing
@@ -119,6 +154,7 @@ def parse_i3d(filepath: Path) -> I3DScene:
     materials_elem = root.find('Materials')
     shapes_elem    = root.find('Shapes')
     scene_elem     = root.find('Scene')
+    animation_elem = root.find('Animation')
 
     if files_elem is not None:
         for f in files_elem.findall('File'):
@@ -200,6 +236,10 @@ def parse_i3d(filepath: Path) -> I3DScene:
             if node is not None:
                 scene.roots.append(node)
 
+    if animation_elem is not None:
+        scene.external_anim_file = animation_elem.get('externalAnimFile')
+        scene.animation_sets = _parse_animation_sets(animation_elem)
+
     # <UserAttributes> sits at root level, after <Scene>. Each <UserAttribute
     # nodeId="N"> contains one or more <Attribute name="X" type="Y" value="Z"/>.
     user_attrs_elem = root.find('UserAttributes')
@@ -224,6 +264,41 @@ def parse_i3d(filepath: Path) -> I3DScene:
                 scene.user_attributes[nid] = attrs
 
     return scene
+
+
+def _parse_animation_sets(animation_elem: ET.Element) -> List[I3DAnimationSet]:
+    sets: List[I3DAnimationSet] = []
+    sets_elem = animation_elem.find('AnimationSets')
+    if sets_elem is None:
+        return sets
+
+    for set_elem in sets_elem.findall('AnimationSet'):
+        anim_set = I3DAnimationSet(
+            name=set_elem.get('name', ''),
+            raw_attrs=dict(set_elem.attrib),
+        )
+        for clip_elem in set_elem.findall('Clip'):
+            clip = I3DAnimationClip(
+                name=clip_elem.get('name', ''),
+                duration=_to_float(clip_elem.get('duration'), default=0.0),
+                raw_attrs=dict(clip_elem.attrib),
+            )
+            for keyframes_elem in clip_elem.findall('Keyframes'):
+                node_id = _to_int(keyframes_elem.get('nodeId'), default=-1)
+                keyframes = I3DAnimationKeyframes(node_id=node_id)
+                for key_elem in keyframes_elem.findall('Keyframe'):
+                    raw_attrs = dict(key_elem.attrib)
+                    keyframes.keys.append(I3DAnimationKey(
+                        time=_to_float(key_elem.get('time'), default=0.0),
+                        translation=_parse_optional_vec3(key_elem.get('translation')),
+                        rotation=_parse_optional_vec3(key_elem.get('rotation')),
+                        scale=_parse_optional_vec3(key_elem.get('scale')),
+                        raw_attrs=raw_attrs,
+                    ))
+                clip.keyframes.append(keyframes)
+            anim_set.clips.append(clip)
+        sets.append(anim_set)
+    return sets
 
 
 def _parse_node(elem: ET.Element) -> Optional[I3DSceneNode]:
@@ -306,6 +381,12 @@ def _parse_vec3(s, default):
         return (float(parts[0]), float(parts[1]), float(parts[2]))
     except ValueError:
         return default
+
+
+def _parse_optional_vec3(s):
+    if not s:
+        return None
+    return _parse_vec3(s, default=None)
 
 
 def _to_int(s, default=0):

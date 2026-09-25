@@ -54,6 +54,10 @@ if "importer" in locals():
     importlib.reload(i3d_wheel_loader)
     importlib.reload(i3d_crawler_path)
     importlib.reload(i3d_crawler_loader)
+    if "i3d_anim_reader" in locals():
+        importlib.reload(i3d_anim_reader)
+    else:
+        from . import i3d_anim_reader
     importlib.reload(i3d_shapes_reader)
     importlib.reload(i3d_shapes_models)
     importlib.reload(i3d_shapes_to_meshdata)
@@ -72,6 +76,7 @@ else:
     from . import i3d_wheel_loader
     from . import i3d_crawler_path
     from . import i3d_crawler_loader
+    from . import i3d_anim_reader
     from . import i3d_shapes_reader
     from . import i3d_shapes_models
     from . import i3d_shapes_to_meshdata
@@ -395,6 +400,15 @@ class IMPORT_OT_fs25_i3d(Operator, ImportHelper):
         default=DEFAULT_TERRAIN_POC_LAYER_NAMES,
     )
 
+    import_animations: BoolProperty(
+        name="Import animations",
+        description=(
+            "Import inline/external i3d animations as Blender Actions. "
+            "Leave off for the original standard mesh/armature import path."
+        ),
+        default=False,
+    )
+
     def invoke(self, context, event):
         prefs = context.preferences.addons[__package__].preferences
         self.apply_axis_correction = prefs.apply_axis_correction_default
@@ -465,6 +479,7 @@ class IMPORT_OT_fs25_i3d(Operator, ImportHelper):
                 terrain_lod=self.terrain_lod,
                 terrain_base_color=tuple(self.terrain_base_color),
                 terrain_poc_layer_names=self.terrain_poc_layer_names,
+                import_animations=self.import_animations,
                 fs25_data_base=data_base,
                 export_dir=prefs.export_dir,
                 snippets_blend_path=DEFAULT_SNIPPETS_BLEND_PATH,
