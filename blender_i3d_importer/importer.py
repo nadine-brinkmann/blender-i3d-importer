@@ -2105,7 +2105,7 @@ def _build_material(material_id, scene, image_cache, shader_cache, i3d_dir, repo
     # material (built below if BUILD_PBR_DEBUG_MATERIALS is enabled).
 
     # Re-export relevant material properties
-    _apply_material_custom_properties(mat, mat_attrs, scene, report, mat_name)
+    _apply_material_custom_properties(mat, mat_attrs, scene, report, mat_name, i3d_dir)
 
     # PBR debug material 
     # Default behavior: lives only in bpy.data.materials with use_fake_user=True,
@@ -2158,7 +2158,7 @@ def _build_material(material_id, scene, image_cache, shader_cache, i3d_dir, repo
     return mat
 
 
-def _apply_material_custom_properties(mat, mat_attrs, scene, report, mat_name):
+def _apply_material_custom_properties(mat, mat_attrs, scene, report, mat_name, i3d_dir):
     """Set re-export relevant material properties as custom properties on the
     bpy.data.materials datablock (schema: Giants i3d Exporter, verified in
     io_export_i3d_*/dcc/dccBlender.py 1742-1769).
@@ -2216,8 +2216,19 @@ def _apply_material_custom_properties(mat, mat_attrs, scene, report, mat_name):
         try:
             fid = int(fid_str)
             path = scene.files.get(fid)
+            # if path:
+                # mat[f'customTexture_{name}'] = path
             if path:
-                mat[f'customTexture_{name}'] = path
+                resolved_path = _resolve_filepath(path, i3d_dir)
+
+                if resolved_path is not None:
+                    mat[f'customTexture_{name}'] = str(resolved_path.resolve())
+                else:
+                    report(
+                        'WARNING',
+                        f"Material '{mat_name}': custom map '{name}' "
+                        f"could not be resolved: {path}"
+                    )
                 # Mod-local (non-$data) custom maps: the Giants exporter resolves
                 # customTexture_* paths relative to the .blend folder (no isabs
                 # handling), so these only survive re-export when the .blend is
